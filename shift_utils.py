@@ -199,11 +199,17 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
 
     leave_value = str(_get_first_value(row_data, ['\u516c\u4f11', '\u4f11\u5047'])).strip()
     if leave_value and leave_value != 'nan':
+        leave_value = re.sub(r'\s{3,}', '\n', leave_value)
         nurse.original_leave_text = leave_value
 
     remark_value = str(_get_first_value(row_data, ['\u5099\u8a3b', '\u8a3b\u8a18'])).strip()
     if remark_value and remark_value != 'nan':
+        leave_value = re.sub(r'\s{3,}', '\n', leave_value)
         nurse.remarks = remark_value
+
+    combined_text = str(original_name) + str(leave_value) + str(remark_value)
+    if any(keyword in combined_text for keyword in ['懷孕', '免輪值', '離職', '育嬰', '安胎']):
+        nurse.is_exempt = True
 
     field_values = []
     if leave_value and leave_value != 'nan':

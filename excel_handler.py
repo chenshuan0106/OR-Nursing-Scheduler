@@ -841,18 +841,11 @@ def _write_schedule_sheet(
         # 新產生的待補班
         if nurse.new_pending_makeup:
             for makeup in nurse.new_pending_makeup:
-                # 檢查是否有預先組好的文字 (例如假日班的 !4/3白班)
-                if 'original_text' in makeup:
-                    remarks_parts.append(makeup['original_text'])
-                else:
-                    # 大夜、小夜週的傳統待補班格式
-                    first_date = min(makeup['dates'])
-                    last_date = max(makeup['dates'])
-                    if first_date == last_date:
-                        date_range = f"{first_date.month}/{first_date.day}"
-                    else:
-                        date_range = f"{first_date.month}/{first_date.day}-{last_date.month}/{last_date.day}"
-                    remarks_parts.append(f"待補班:{date_range}{makeup['shift_type']}")
+                from date_utils import format_dates_to_dot_string
+                first_date = min(makeup['dates'])
+                last_date = max(makeup['dates'])
+                date_range = f"{first_date.month}/{first_date.day}-{last_date.month}/{last_date.day}"
+                remarks_parts.append(f"待補班:{date_range}{makeup['shift_type']}")
         
         final_remarks_text = '\n'.join(remarks_parts) if remarks_parts else ''
         green_font = Font(name='標楷體', color=COLORS['p_shift_green'])

@@ -27,7 +27,7 @@ from holiday_shift import (
     print_holiday_shift_preview,
     format_holiday_shift_result,
 )
-from excel_handler_v0 import (
+from excel_handler import (
     read_nurses_from_excel,
     get_sheet_names,
     find_last_assigned_from_excel,
@@ -192,7 +192,7 @@ def process_sheet(
 
     # 讀取跨月補班記錄（!開頭的假日班）
     print("讀取跨月補班記錄...")
-    from excel_handler_v0 import read_cross_month_makeup_holidays_from_excel
+    from excel_handler import read_cross_month_makeup_holidays_from_excel
     cross_month_makeups = read_cross_month_makeup_holidays_from_excel(filepath, sheet_name, month, year)
     
     # 填充到每個護理人員
@@ -208,19 +208,9 @@ def process_sheet(
     # ===========================
     # 1. 大夜班排班（第一步）
     # ===========================
-    
-    # 本月護理師名單（用來驗證 # 對應的人是否仍存在）
-    nurse_names = [n.name for n in nurses]
-
     # 如果沒有指定上月最後排班者，從 Excel 大夜欄自動讀取
     if not last_assigned_night_name:
-        last_assigned_night_name = find_last_assigned_from_excel(
-                filepath,
-                sheet_name,
-                month,
-                year,
-                nurse_names=nurse_names
-            )
+        last_assigned_night_name = find_last_assigned_from_excel(filepath, sheet_name, month, year)
         if last_assigned_night_name:
             print(f"從 Excel 讀取到大夜班上個月最後排班: {last_assigned_night_name}")
 

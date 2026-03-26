@@ -11,7 +11,6 @@ from shift_utils import (
     should_skip_for_consecutive_days,
     parse_nurse_info_from_row,
 )
-
 from date_utils import (
     format_dates_to_dot_string,
     get_night_shift_groups_for_month,
@@ -30,11 +29,13 @@ def should_skip_night_shift(
 ) -> Tuple[bool, str]:
     """
     判斷護理人員是否應該跳過這次大夜班
+    
+    返回: (是否跳過, 原因)
+    
+    注意：大夜班是前一天晚上 11 點上班
+    例如排 3/16 的大夜，實際 3/15 晚上 11 點就要去
+    所以公休到 3/15 的人不能排 3/16 開始的 cost
     """
-    # 0. 【新增】全域免排班檢查：懷孕、交叉訓練等直接跳過，且不需補班
-    if getattr(nurse, 'is_exempt', False):
-        return True, getattr(nurse, 'exempt_reason', '免排班')
-
     # 1. 檢查特殊狀態（55歲、哺乳）
     skip, reason = should_skip_for_special_status(nurse)
     if skip:
@@ -66,7 +67,7 @@ def schedule_night_shifts(
     target_month: int,
     last_assigned_index: int = -1,
     include_next_month_first: bool = True,
-) -> Tuple[List[Dict], str, set]:
+) -> Tuple[List[Dict], str]:
     """
     排大夜班
 

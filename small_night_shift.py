@@ -94,9 +94,6 @@ def should_skip_small_night_shift(
 
     返回: (是否跳過, 原因)
     """
-    # 0. 【新增】全域免排班檢查：懷孕、交叉訓練等直接跳過，且不需補班
-    if getattr(nurse, 'is_exempt', False):
-        return True, getattr(nurse, 'exempt_reason', '免排班')
 
     # 1. 檢查特殊狀態（小夜班只檢查哺乳，不檢查55歲）
     if nurse.is_breastfeeding:
@@ -134,7 +131,7 @@ def schedule_small_night_shifts(
     target_month: int,
     last_assigned_index: int = -1,
     include_next_month_first: bool = True,
-) -> Tuple[List[Dict], str, set]:
+) -> Tuple[List[Dict], str]:
     """
     排小夜班
 

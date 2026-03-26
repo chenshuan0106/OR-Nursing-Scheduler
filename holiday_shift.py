@@ -538,10 +538,6 @@ def check_should_skip_holiday_shift(
         - need_find_next: 是否需要找下一個可以的班
         - adjust_type: 班型調整類型（哺乳/55歲）
     """
-    # 0. 【新增】全域免排班檢查：懷孕、交叉訓練等直接跳過，且不需補班
-    if getattr(nurse, 'is_exempt', False):
-        return SkipInfo(True, getattr(nurse, 'exempt_reason', '免排班'), False)
-    
     # 1. 檢查公休（直接跳過，不用補）
     skip, reason = check_leave_conflict(nurse, slot)
     if skip:
@@ -581,7 +577,7 @@ def check_should_skip_holiday_shift(
         if compensation:
             return SkipInfo(
                 True,
-                f"國定假日補償({compensation['date'].month}/{compensation['date'].day}{compensation['shift_type']})",
+                f"??????({compensation['date'].month}/{compensation['date'].day}{compensation['shift_type']})",
                 False,
                 is_compensation=True
             )
@@ -672,7 +668,7 @@ def schedule_holiday_shifts(
         slot_key = (slot.date.date(), slot.shift_type_id)
         if slot_key in cross_month_makeup_slots:
             nurse_name = cross_month_makeup_slots[slot_key]
-            # ... 找到 nurse 的邏輯 ...
+            # ????????
             nurse = next((n for n in nurses if n.name == nurse_name), None)
             if nurse:
                 skip_cross_month = False
@@ -767,45 +763,32 @@ def schedule_holiday_shifts(
                 # 所以不 continue，讓後續邏輯可以處理這個 slot
 
                 if not skip_cross_month:
-                    # 建立排班結果，使用當前的 cycle 作為欄位索引
+                    # ?????????????cycle???????
                     result = HolidayShiftResult(
                         slot=slot,
                         nurse=nurse,
-                        column_index=cycle + 1,  # 寫入對應的 cycle 欄位
-                        is_cross_month_makeup=True,  # 標記這是一筆跨月補班
+                        column_index=cycle + 1,  # ????cycle
+                        is_cross_month_makeup=True,  # ???????
                     )
                     results.append(result)
                     assigned_this_month.add(nurse.name)
                     
                     print(f"  ????: {nurse.name} {slot.display_text} [??{cycle + 1}]")
                     
-                    # 跨月補班成功後，不推進 cycle 也不改變 current_index
-                    # 因為跨月補班是直接「佔用」該時段，屬於插隊排班
-                    # 讓這個時段被佔用掉後，直接進行下一個時段的排班
-                    continue  # 處理下一個 slot
+                    # ???cycle???????????????
+                    # ???????????????????????????
+                    # ??????????????????
+                    continue  # ??????????????
         
         assigned = False
 
         # 1. 先檢查待補班佇列（FIFO：先跳過的先補，不限班型）
         # 重要：待補班可以補到「任何」可用的班，不限於原本被跳過的班型
-        # 處理待補班佇列中剩餘的人
         if makeup_queue:
-            print(f"\n注意: 以下人員本月找不到合適的班:")
-            for nurse_idx, original_slot, adjust_type, _, original_cycle in makeup_queue:
-                nurse = nurses[nurse_idx]
-                adjust_desc = f", 需{adjust_type}" if adjust_type else ""
-                print(f"  - {nurse.name} (原{original_slot.display_text}{adjust_desc}) [原欄位{original_cycle + 1}]")
-                
-                # 👇 【新增的部分】將本月無法排入的假日補班，存入護理人員物件中
-                # 這樣 excel_handler 才能讀到這筆資料，並寫出到 Excel 的備註欄或提供下月參考
-                nurse.new_pending_makeup.append({
-                    'dates': [original_slot.date],  # 統一格式放入 list
-                    'shift_type': f"假日{original_slot.shift_name}", # 標記為假日班（如：假日白班、假日小夜）
-                    'original_text': f"!{original_slot.date.month}/{original_slot.date.day}{original_slot.shift_name}" # 預先組好下個月需要的 ! 格式
-                })
-
-        # 標記正常輪序最後一個班次（不含補班、不含下月、不含國假補償、不含跳過記錄）
-        last_normal_result = None
+            print(f"\n  [待補班檢查] {slot.display_text} - 佇列中有 {len(makeup_queue)} 人待補班")
+            for q_idx, (q_nurse_idx, q_original_slot, q_adjust, _, q_cycle) in enumerate(makeup_queue):
+                q_nurse = nurses[q_nurse_idx]
+                print(f"    佇列[{q_idx}]: {q_nurse.name} (原{q_original_slot.display_text}, 欄位{q_cycle+1})")
 
         # 使用 while 迴圈，這樣補償跳過後可以繼續檢查下一個人
         makeup_idx = 0
