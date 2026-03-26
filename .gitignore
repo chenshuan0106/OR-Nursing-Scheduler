@@ -1,0 +1,28 @@
+# 系統檔
+Thumbs.db
+desktop.ini
+
+# 私人資料 / 班表資料
+data/private/
+*.xlsx
+*.csv
+
+# Python 環境與快取
+.venv/
+__pycache__/
+.pytest_cache/
+
+# 打包產物
+build/
+dist/
+*.exe
+*.zip
+*.pkg
+
+# 執行紀錄（可能含人員姓名）
+*.log
+
+# 本機工具設定
+.claude/
+.agents/
+.vscode/
