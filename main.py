@@ -196,9 +196,21 @@ def process_sheet(
     cross_month_makeups = read_cross_month_makeup_holidays_from_excel(filepath, sheet_name, month, year)
     
     # 填充到每個護理人員
+    # cross_month_makeups 的每筆記錄有 type: 'fixed' 或 'pending'
     for nurse in nurses:
         if nurse.name in cross_month_makeups:
-            nurse.previous_month_cross_month_makeup_holidays = cross_month_makeups[nurse.name]
+            records = cross_month_makeups[nurse.name]
+            # 有日期的跨月補班 → previous_month_cross_month_makeup_holidays
+            fixed = [r for r in records if r['type'] == 'fixed']
+            if fixed:
+                nurse.previous_month_cross_month_makeup_holidays = fixed
+            # 純待補班（無日期）→ pending_holiday_makeup
+            pending = [r for r in records if r['type'] == 'pending']
+            for p in pending:
+                nurse.pending_holiday_makeup.append({
+                    'original_text': p['original_text'],
+                })
+                print(f"  {nurse.name} 加入假日待補班佇列: {p['original_text']}")
 
     # 如果沒有護理人員，直接返回空結果
     if not nurses:

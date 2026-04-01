@@ -1040,28 +1040,35 @@ def read_cross_month_makeup_holidays_from_excel(
     target_year: int,
 ) -> Dict[str, List[Dict]]:
     """
-    從 Excel 假日班欄位讀取跨月補班記錄（!開頭的）
-    
+    從 Excel 假日班欄位讀取跨月補班記錄。
+
+    支援兩種格式：
+    1. 有日期有班別：「6/7白班」、「6/6小夜」（舊格式 !6/7白班 也相容）
+       → 鎖定該時段，回傳 type='fixed'
+    2. 純待補班：「6月補」
+       → 加入待補班佇列，回傳 type='pending'
+
     Returns:
         {
             'nurse_name': [
-                {'date': datetime, 'shift_type': '白班', 'slot_type': 'sat_day', 'original_text': '!4/3白班'},
-                ...
+                {'type': 'fixed', 'date': datetime, 'shift_type': '白班',
+                 'slot_type': 'sat_day', 'original_text': '6/7白班'},
+                {'type': 'pending', 'original_text': '6月補'},
             ],
             ...
         }
     """
     from datetime import datetime
     import re
-    
+
     wb = load_workbook(filepath, data_only=True)
     ws = wb[sheet_name]
-    
+
     # 找到表頭
     header_row = None
     name_col = None
-    holiday_cols = []  # 假日欄位的索引列表
-    
+    holiday_cols = []
+
     for row_idx in range(1, 10):
         row_values = [cell.value for cell in ws[row_idx]]
         if '主值' in row_values or '副值' in row_values:
@@ -1072,89 +1079,92 @@ def read_cross_month_makeup_holidays_from_excel(
                 elif value and '假日' in str(value):
                     holiday_cols.append(col_idx)
             break
-    
+
     if not header_row or not name_col or not holiday_cols:
         wb.close()
         return {}
-    
-    # 讀取每個護理人員的跨月補班記錄
+
+    def _parse_slot_type(date, shift_type):
+        """根據日期星期和班別判斷 slot_type"""
+        weekday = date.weekday()
+        if weekday == 5:  # 週六
+            if shift_type == '白班':
+                return 'sat_day'
+            elif shift_type == '小夜':
+                return 'sat_small_night'
+        elif weekday == 6:  # 週日
+            if shift_type == '大夜':
+                return 'sun_night'
+            elif shift_type == '白班':
+                return 'sun_day'
+            elif shift_type == '小夜':
+                return 'sun_small_night'
+        else:  # 平日國定假日
+            if shift_type == '白班':
+                return 'weekday_holiday_day'
+            elif shift_type == '小夜':
+                return 'weekday_holiday_small_night'
+            elif shift_type == '大夜':
+                return 'weekday_holiday_night'
+        return None
+
     nurse_makeups = {}
-    
+
     for row_idx in range(header_row + 1, ws.max_row + 1):
         name_cell = ws.cell(row=row_idx, column=name_col).value
         if not name_cell:
             continue
-        
-        # 處理名字（移除*號）
+
         name = str(name_cell).lstrip('*').strip()
         if not name:
             continue
-        
-        # 檢查所有假日欄位
+
         for col_idx in holiday_cols:
             cell_value = ws.cell(row=row_idx, column=col_idx).value
             if not cell_value:
                 continue
-            
+
             text = str(cell_value).strip()
-            
-            # 檢查是否以!開頭（跨月補班標記）
-            if text.startswith('!'):
-                # 解析格式：!4/3白班 或 !4/3小夜
-                # 移除!標記
-                content = text[1:].strip()
-                
-                # 解析日期和班別
-                # 格式：4/3白班、4/3小夜、4/3大夜
-                match = re.match(r'(\d+)/(\d+)\s*(白班|小夜|大夜)', content)
-                if match:
-                    month = int(match.group(1))
-                    day = int(match.group(2))
-                    shift_type = match.group(3)
-                    
-                    # 只處理本月的補班記錄
-                    if month == target_month:
-                        try:
-                            date = datetime(target_year, month, day)
-                            
-                            # 判斷假日班類型
-                            weekday = date.weekday()
-                            slot_type = None
-                            if weekday == 5:  # 週六
-                                if shift_type == '白班':
-                                    slot_type = 'sat_day'
-                                elif shift_type == '小夜':
-                                    slot_type = 'sat_small_night'
-                            elif weekday == 6:  # 週日
-                                if shift_type == '大夜':
-                                    slot_type = 'sun_night'
-                                elif shift_type == '白班':
-                                    slot_type = 'sun_day'
-                                elif shift_type == '小夜':
-                                    slot_type = 'sun_small_night'
-                            else:  # 平日國定假日
-                                if shift_type == '白班':
-                                    slot_type = 'weekday_holiday_day'
-                                elif shift_type == '小夜':
-                                    slot_type = 'weekday_holiday_small_night'
-                                elif shift_type == '大夜':
-                                    slot_type = 'weekday_holiday_night'
-                            
-                            if slot_type:
-                                if name not in nurse_makeups:
-                                    nurse_makeups[name] = []
-                                
-                                nurse_makeups[name].append({
-                                    'date': date,
-                                    'shift_type': shift_type,
-                                    'slot_type': slot_type,
-                                    'original_text': text
-                                })
-                                
-                                print(f"  讀取跨月補班: {name} {text}")
-                        except ValueError:
-                            # 日期無效，跳過
-                            pass
-    
+
+            # --- 格式1：純待補班「X月補」---
+            pending_match = re.match(r'^(\d+)月補$', text)
+            if pending_match:
+                month_num = int(pending_match.group(1))
+                if month_num == target_month:
+                    if name not in nurse_makeups:
+                        nurse_makeups[name] = []
+                    nurse_makeups[name].append({
+                        'type': 'pending',
+                        'original_text': text,
+                    })
+                    print(f"  讀取假日待補班: {name} {text}")
+                continue
+
+            # --- 格式2：有日期有班別「6/7白班」或舊格式「!6/7白班」---
+            content = text.lstrip('!').strip()
+            match = re.match(r'^(\d+)/(\d+)\s*(白班|小夜|大夜)$', content)
+            if match:
+                month_num = int(match.group(1))
+                day = int(match.group(2))
+                shift_type = match.group(3)
+
+                if month_num == target_month:
+                    try:
+                        date = datetime(target_year, month_num, day)
+                        slot_type = _parse_slot_type(date, shift_type)
+                        if slot_type:
+                            if name not in nurse_makeups:
+                                nurse_makeups[name] = []
+                            nurse_makeups[name].append({
+                                'type': 'fixed',
+                                'date': date,
+                                'shift_type': shift_type,
+                                'slot_type': slot_type,
+                                'original_text': text,
+                            })
+                            print(f"  讀取跨月補班(有日期): {name} {text}")
+                    except ValueError:
+                        pass
+
     wb.close()
     return nurse_makeups

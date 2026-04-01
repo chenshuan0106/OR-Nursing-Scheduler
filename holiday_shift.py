@@ -659,9 +659,21 @@ def schedule_holiday_shifts(
     # has_assigned_this_month: 這個人本月是否已經有排過假日班
     # original_cycle: 被跳過時的 cycle（用來決定回補填入哪個欄位）
     makeup_queue: List[Tuple[int, HolidayShiftSlot, Optional[str], bool, int]] = []
-    
+
     # 追蹤每個人本月是否已經有排過假日班
     assigned_this_month: Set[str] = set()
+
+    # 從上個月帶來的「X月補」純待補班 → 加入 makeup_queue 最前面，優先排班
+    # 用一個虛擬 slot 代表「任何可用的班」，adjust_type=None 表示不限班型
+    print("\n處理上月帶來的假日待補班（X月補）...")
+    pending_dummy_slot = None  # 用第一個本月 slot 當佔位，實際排班時不限制
+    for nurse in nurses:
+        if nurse.pending_holiday_makeup:
+            nurse_idx = nurses.index(nurse)
+            for _ in nurse.pending_holiday_makeup:
+                # 用 None 當 original_slot，排班邏輯裡會特別處理
+                makeup_queue.append((nurse_idx, None, None, False, 0))
+                print(f"  {nurse.name} 加入假日補班佇列（無指定日期）")
     
     for slot in all_slots:
         # 0. 先檢查這個時段是否被跨月補班佔用
@@ -788,7 +800,8 @@ def schedule_holiday_shifts(
             print(f"\n  [待補班檢查] {slot.display_text} - 佇列中有 {len(makeup_queue)} 人待補班")
             for q_idx, (q_nurse_idx, q_original_slot, q_adjust, _, q_cycle) in enumerate(makeup_queue):
                 q_nurse = nurses[q_nurse_idx]
-                print(f"    佇列[{q_idx}]: {q_nurse.name} (原{q_original_slot.display_text}, 欄位{q_cycle+1})")
+                orig_text = q_original_slot.display_text if q_original_slot else '無指定(X月補)'
+                print(f"    佇列[{q_idx}]: {q_nurse.name} (原{orig_text}, 欄位{q_cycle+1})")
 
         # 使用 while 迴圈，這樣補償跳過後可以繼續檢查下一個人
         makeup_idx = 0
@@ -898,12 +911,13 @@ def schedule_holiday_shifts(
                 continue
 
             if force_assign or not skip_info.should_skip:
+                orig_text = original_slot.display_text if original_slot else '無指定(X月補)'
                 result = HolidayShiftResult(
                     slot=slot,
                     nurse=nurse,
                     column_index=original_cycle + 1,  # 用原本被跳過時的 cycle
                     is_makeup=True,
-                    original_slot_text=original_slot.display_text,
+                    original_slot_text=orig_text,
                 )
                 results.append(result)
                 assigned_this_month.add(nurse.name)
@@ -911,10 +925,12 @@ def schedule_holiday_shifts(
                 # 從佇列中移除
                 makeup_queue.pop(makeup_idx)
 
-                # 說明：補班不限班型，先跳過的先補
-                is_same_shift_type = (original_slot.shift_type_id == slot.shift_type_id)
-                cross_type_note = "" if is_same_shift_type else f" (跨班型補班: 原{original_slot.shift_name}→現{slot.shift_name})"
-                print(f"  ★ 待補班成功: {nurse.name} {slot.display_text} (原{original_slot.display_text}) [欄位{original_cycle + 1}]{cross_type_note}")
+                if original_slot:
+                    is_same_shift_type = (original_slot.shift_type_id == slot.shift_type_id)
+                    cross_type_note = "" if is_same_shift_type else f" (跨班型補班: 原{original_slot.shift_name}→現{slot.shift_name})"
+                    print(f"  ★ 待補班成功: {nurse.name} {slot.display_text} (原{original_slot.display_text}) [欄位{original_cycle + 1}]{cross_type_note}")
+                else:
+                    print(f"  ★ 待補班成功(X月補): {nurse.name} {slot.display_text} [欄位{original_cycle + 1}]")
                 assigned = True
                 break
 
