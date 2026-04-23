@@ -282,23 +282,23 @@ def find_last_assigned_holiday_from_excel(
 ) -> Optional[str]:
     """
     從 Excel 假日班欄位找到上個月最後排班的人
-    
-    假日班欄位：現在是三個「假日」欄位
-    
-    邏輯：找所有假日欄位中日期屬於「上個月」的最後一筆資料
+
+    邏輯（依優先順序）：
+    1. 找有 # 標記的人（明確定位點）
+    2. 找假日欄中屬於「目標月份（本月）」日期的最後一筆
+       上個月排班時會預排本月第一週的班（跨月班），
+       這些跨月班代表上個月輪值的真正結束點。
+       例如：5月班表假日欄出現 6/6白班、6/7小夜 → 最後那人是5月的定位點
+    3. 若無跨月班，退回找上個月日期的最後一筆（舊邏輯備用）
     """
     wb = load_workbook(filepath, data_only=True)
     ws = wb[sheet_name]
-    
-    # 計算上個月
-    prev_month = target_month - 1 if target_month > 1 else 12
-    prev_year = target_year if target_month > 1 else target_year - 1
-    
+
     # 找到表頭
     header_row = None
     name_col = None
-    holiday_cols = []  # 假日欄位的索引列表
-    
+    holiday_cols = []
+
     for row_idx in range(1, 10):
         row_values = [cell.value for cell in ws[row_idx]]
         if '主值' in row_values or '副值' in row_values:
@@ -309,11 +309,12 @@ def find_last_assigned_holiday_from_excel(
                 elif value == '假日':
                     holiday_cols.append(col_idx)
             break
-    
+
     if not header_row or not name_col or not holiday_cols:
         wb.close()
         return None
 
+    # 1. 找 # 標記
     marked_name = None
     for row_idx in range(header_row + 1, ws.max_row + 1):
         name = ws.cell(row=row_idx, column=name_col).value
@@ -324,37 +325,65 @@ def find_last_assigned_holiday_from_excel(
             cell_value = ws.cell(row=row_idx, column=col_idx).value
             if not cell_value:
                 continue
-            cell_str = str(cell_value)
-            if '#' in cell_str:
+            if '#' in str(cell_value):
                 marked_name = name
 
     if marked_name:
         wb.close()
         return marked_name
-    
-    # 找上個月最後排班的人
-    last_assigned = None
-    last_date = None
-    
+
+    # 2. 找假日欄中屬於「目標月份（本月）」的跨月班日期
+    #    按照 (日期, 欄位索引) 排序取最後一筆，確保 sun_small 優先於 sat_day
+    cross_month_candidates = []  # [(date, col_idx, name)]
+
     for row_idx in range(header_row + 1, ws.max_row + 1):
         name = ws.cell(row=row_idx, column=name_col).value
-        
         if not name:
             continue
-        
         name = str(name).strip().lstrip('*')
-        
-        # 檢查所有假日欄位
-        for col_idx in holiday_cols:
+
+        for col_pos, col_idx in enumerate(holiday_cols):
             cell_value = ws.cell(row=row_idx, column=col_idx).value
-            
             if not cell_value:
                 continue
-            
             cell_str = str(cell_value).strip()
-            
-            # 解析日期（格式可能是 "3/8白班" 或 "3/15白班(原3/8小夜)"）
+            # 排除純文字記錄（換心、P班、公休說明等）
+            if any(kw in cell_str for kw in ['換心', 'P1', 'P2', '補班', '月補']):
+                continue
+            if cell_str.startswith('公休') or cell_str.startswith('婚假'):
+                continue
             # 提取第一個日期
+            date_match = re.search(r'(\d{1,2}/\d{1,2})', cell_str)
+            if date_match:
+                date = parse_date_string(date_match.group(1), target_year)
+                # 跨月預告班只排下個月第一週（最多到第7日），加上 day <= 7 避免把當月正常班誤判
+                if date and date.month == target_month and date.day <= 7:
+                    cross_month_candidates.append((date, col_pos, name))
+
+    if cross_month_candidates:
+        # 按日期升序、欄位索引升序排序，最後一筆即是定位點
+        cross_month_candidates.sort(key=lambda x: (x[0], x[1]))
+        last_name = cross_month_candidates[-1][2]
+        print(f"假日班定位點（跨月班）: {last_name} (找到 {len(cross_month_candidates)} 筆跨月記錄)")
+        wb.close()
+        return last_name
+
+    # 3. 退回舊邏輯：找上個月日期的最後一筆
+    prev_month = target_month - 1 if target_month > 1 else 12
+    last_assigned = None
+    last_date = None
+
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        name = ws.cell(row=row_idx, column=name_col).value
+        if not name:
+            continue
+        name = str(name).strip().lstrip('*')
+
+        for col_idx in holiday_cols:
+            cell_value = ws.cell(row=row_idx, column=col_idx).value
+            if not cell_value:
+                continue
+            cell_str = str(cell_value).strip()
             date_match = re.search(r'(\d{1,2}/\d{1,2})', cell_str)
             if date_match:
                 date = parse_date_string(date_match.group(1), target_year)
@@ -362,7 +391,7 @@ def find_last_assigned_holiday_from_excel(
                     if last_date is None or date > last_date:
                         last_date = date
                         last_assigned = name
-    
+
     wb.close()
     return last_assigned
 
@@ -768,6 +797,45 @@ def _write_schedule_sheet(
         leave_text = nurse.original_leave_text
         if leave_text:
             leave_text = re.sub(r'\s*[\u3001\uff0c,;\uff1b]\s*', '\n', leave_text)
+
+        # 補上「非本月」的 P班/換心 前綴（這些資訊來自大夜/小夜週等欄位，不在公休欄）
+        # 例如：測試甲公休='6/8-6/21'，但 is_p1={'5月':'大P1'} → 輸出 '5月大P1\n6/8-6/21'
+        prev_month_labels = []
+        month_key_current = f'{month}月'
+        # 收集所有非本月的 P班/換心 標記
+        for mk, pv in nurse.is_p1.items():
+            if mk != month_key_current:
+                label = f'{mk}{pv}' if isinstance(pv, str) else f'{mk}P1'
+                # 避免重複（已在 leave_text 中存在的不再加）
+                if leave_text and label in leave_text:
+                    continue
+                prev_month_labels.append((mk, label))
+        for mk, pv in nurse.is_p2.items():
+            if mk != month_key_current:
+                label = f'{mk}{pv}' if isinstance(pv, str) else f'{mk}P2'
+                if leave_text and label in leave_text:
+                    continue
+                prev_month_labels.append((mk, label))
+        for mk, tv in nurse.is_transplant.items():
+            if mk != month_key_current and tv:
+                label = f'{mk}換心'
+                if leave_text and label in leave_text:
+                    continue
+                prev_month_labels.append((mk, label))
+        # 按月份排序，讓較早的月份在前
+        if prev_month_labels:
+            def month_sort_key(item):
+                mk_str = item[0]  # e.g. '5月'
+                try:
+                    return int(mk_str.replace('月', ''))
+                except Exception:
+                    return 99
+            prev_month_labels.sort(key=month_sort_key)
+            prefix = '\n'.join(lbl for _, lbl in prev_month_labels)
+            if leave_text:
+                leave_text = prefix + '\n' + leave_text
+            else:
+                leave_text = prefix
         
         # 檢查是否包含「滿55歲跳大夜」或「55歲跳大夜」等相關文字
         has_age_55_restriction = False

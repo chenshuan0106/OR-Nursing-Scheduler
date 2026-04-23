@@ -319,7 +319,16 @@ def main():
         return
 
     # 從 Excel 標題自動讀取年份和月份
-    roc_year, month = parse_title_year_month(input_file)
+    roc_year, input_month = parse_title_year_month(input_file)
+    # 計算目標月份（輸出月 = 輸入月 + 1）
+    if input_month == 12:
+        month = 1
+        year = roc_to_western_year(roc_year) + 1
+        roc_year = roc_year + 1
+    else:
+        month = input_month + 1
+        year = roc_to_western_year(roc_year)
+
     if roc_year is None or month is None:
         print("錯誤: 無法從 Excel 標題解析年份和月份")
         print("請確認標題格式為: XXX年X月值班表")

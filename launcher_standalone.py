@@ -48,7 +48,7 @@ def main():
         return
 
     print("=" * 50)
-    print("  BOR 護理排班系統 v2.0")
+    print("  BOR 護理排班系統 v2.2")
     print("  臺北榮民總醫院護理部思源手術室")
     print("=" * 50)
     print()

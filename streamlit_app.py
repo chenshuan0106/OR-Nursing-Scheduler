@@ -350,6 +350,16 @@ if modules_loaded:
         try:
             # 解析年月
             roc_year, month = parse_title_year_month(tmp_path)
+            roc_year, input_month = parse_title_year_month(tmp_path)
+            
+            # 計算目標月份
+            if input_month == 12:
+                month = 1
+                year = roc_to_western_year(roc_year) + 1
+                roc_year += 1
+            else:
+                month = input_month + 1
+                year = roc_to_western_year(roc_year)
 
             if roc_year is None or month is None:
                 st.error("❌ 無法從 Excel 標題解析年份和月份")
