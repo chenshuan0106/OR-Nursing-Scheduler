@@ -119,7 +119,7 @@ try:
     from config import HOLIDAYS_2026
     from date_utils import roc_to_western_year
     from excel_handler import get_sheet_names, create_schedule_excel_multi_sheet
-    from main import parse_title_year_month, process_sheet
+    from main import parse_title_year_month, process_sheet, build_pre_schedule_check
     modules_loaded = True
 except ImportError as e:
     modules_loaded = False
@@ -425,6 +425,12 @@ if modules_loaded:
                         for idx, sheet_name in enumerate(sheet_names):
                             status_text.text(f"正在處理: {sheet_name} ({idx + 1}/{total_sheets})")
                             progress_bar.progress((idx + 1) / (total_sheets + 1))
+                            pre_schedule_check = build_pre_schedule_check(
+                                tmp_path,
+                                sheet_name,
+                                year,
+                                month,
+                            )
 
                             # 捕捉這個頁籤的輸出
                             sheet_output = io.StringIO()
@@ -457,6 +463,7 @@ if modules_loaded:
                                         'holiday_last_normal': holiday_last_normal,
                                         'night_identity_skipped': night_identity_skipped,
                                         'small_night_identity_skipped': small_night_identity_skipped,
+                                        'pre_schedule_check': pre_schedule_check,
                                     }
                                 except Exception as e:
                                     st.error(f"處理頁籤 {sheet_name} 時發生錯誤: {e}")
