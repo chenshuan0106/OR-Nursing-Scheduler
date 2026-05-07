@@ -321,7 +321,7 @@ def find_last_assigned_holiday_from_excel(
         if not name:
             continue
         name = str(name).strip().lstrip('*')
-        for col_idx in holiday_cols:
+        for col_pos, col_idx in enumerate(holiday_cols, 1):
             cell_value = ws.cell(row=row_idx, column=col_idx).value
             if not cell_value:
                 continue
@@ -398,7 +398,7 @@ def find_last_assigned_holiday_from_excel(
             continue
         name = str(name).strip().lstrip('*')
 
-        for col_idx in holiday_cols:
+        for col_pos, col_idx in enumerate(holiday_cols, 1):
             cell_value = ws.cell(row=row_idx, column=col_idx).value
             if not cell_value:
                 continue
@@ -874,6 +874,38 @@ def _get_cell_text(value) -> str:
     return str(value)
 
 
+def _is_p_or_transplant_text(text) -> bool:
+    if not text:
+        return False
+    text = str(text)
+    return (
+        '月大P1' in text or '月小P1' in text or
+        '月大P2' in text or '月小P2' in text or
+        '月P1' in text or '月P2' in text or
+        '月換心' in text
+    )
+
+
+def _has_future_month_label(text, target_month: int) -> bool:
+    if not text:
+        return False
+    text = str(text)
+    for match in re.finditer(r'(\d{1,2})月', text):
+        if int(match.group(1)) > target_month:
+            return True
+    return False
+
+
+def _apply_identity_font(ws, green_font, gray_font, target_month: int):
+    for row in ws.iter_rows():
+        for cell in row:
+            text = _get_cell_text(cell.value)
+            if _has_future_month_label(text, target_month):
+                cell.font = gray_font
+            elif _is_p_or_transplant_text(text):
+                cell.font = green_font
+
+
 def _text_display_width(text: str) -> int:
     width = 0
     for ch in text:
@@ -966,27 +998,47 @@ def _write_schedule_sheet(
     holiday_assignments = {}
 
     if holiday_results and nurses:
+        max_holiday_output_col = 4
         for result in holiday_results:
             name = result.nurse.name
             new_is_comp = getattr(result, 'is_holiday_compensation', False)
             col_num = getattr(result, 'column_index', 1)
             if col_num < 1:
                 col_num = 1
-            if col_num > 4:
-                col_num = 4
-            key = (name, col_num)
-            existing = holiday_assignments.get(key)
-            if not existing:
-                holiday_assignments[key] = [result]
-            else:
+            if col_num > max_holiday_output_col:
+                continue
+            while True:
+                key = (name, col_num)
+                existing = holiday_assignments.get(key)
+                if not existing:
+                    result.column_index = col_num
+                    holiday_assignments[key] = [result]
+                    break
+
                 existing_is_comp = any(getattr(r, 'is_holiday_compensation', False) for r in existing)
                 existing_has_normal = any(not getattr(r, 'is_holiday_compensation', False) for r in existing)
                 # 同一格允許補休+正常班（擠在一起），避免重複塞相同類型
                 if new_is_comp and existing_is_comp:
-                    continue
+                    break
                 if (not new_is_comp) and existing_has_normal:
-                    continue
+                    next_col = col_num + 1
+                    while next_col <= max_holiday_output_col:
+                        next_existing = holiday_assignments.get((name, next_col))
+                        if not next_existing or not any(
+                            not getattr(r, 'is_holiday_compensation', False)
+                            for r in next_existing
+                        ):
+                            break
+                        next_col += 1
+                    if next_col <= max_holiday_output_col:
+                        col_num = next_col
+                        continue
+                    existing.append(result)
+                    break
+
+                result.column_index = col_num
                 existing.append(result)
+                break
 
     # ????????
     data_row = header_row + 1
@@ -1242,9 +1294,15 @@ def _write_schedule_sheet(
                 first_result = result_list[0]
                 # 判斷補班日期是否為下個月（判斷「(原X/X班)」中的日期）
                 is_next_month_holiday = _is_all_dates_other_month(holiday_text, year, month) if holiday_text else False
+                has_p_or_transplant_text = (
+                    '月大P1' in holiday_text or '月小P1' in holiday_text or
+                    '月大P2' in holiday_text or '月小P2' in holiday_text or
+                    '月P1' in holiday_text or '月P2' in holiday_text or
+                    '月換心' in holiday_text
+                )
 
-                if first_result.slot.is_next_month or is_next_month_holiday:
-                    holiday_cell.font = gray_font
+                if has_p_or_transplant_text:
+                    holiday_cell.font = green_font
                 elif first_result.is_skipped:
                     # 跳過記錄：P/換心用綠色，其他用黑色
                     skip_reason = first_result.skip_reason
@@ -1253,6 +1311,8 @@ def _write_schedule_sheet(
                                           '月P1' in skip_reason or '月P2' in skip_reason or
                                           '月換心' in skip_reason)
                     holiday_cell.font = green_font if is_p_or_transplant else black_font
+                elif first_result.slot.is_next_month or is_next_month_holiday:
+                    holiday_cell.font = gray_font
                 else:
                     holiday_cell.font = red_font
             else:
@@ -1266,6 +1326,8 @@ def _write_schedule_sheet(
     
     # 調整欄寬 - 確保所有欄位都能容納兩行文字
     # 主值, 公休, 備註, 大夜, 小夜週, 假日, 假日, 假日, 假日
+    _apply_identity_font(ws, green_font, gray_font, month)
+
     max_col = len(columns)
     max_row = data_row - 1
     column_widths = [0] * max_col
@@ -1314,11 +1376,13 @@ def read_cross_month_makeup_holidays_from_excel(
     """
     從 Excel 假日班欄位讀取跨月補班記錄。
 
-    支援兩種格式：
+    支援格式：
     1. 有日期有班別：「6/7白班」、「6/6小夜」（舊格式 !6/7白班 也相容）
        → 鎖定該時段，回傳 type='fixed'
     2. 純待補班：「6月補」
        → 加入待補班佇列，回傳 type='pending'
+    3. 指定日期待補班：「6月補@6/14白班」或「6月補 6/14」
+       → 只在指定日期/班別嘗試補班，回傳 type='pending'
 
     Returns:
         {
@@ -1326,6 +1390,8 @@ def read_cross_month_makeup_holidays_from_excel(
                 {'type': 'fixed', 'date': datetime, 'shift_type': '白班',
                  'slot_type': 'sat_day', 'original_text': '6/7白班'},
                 {'type': 'pending', 'original_text': '6月補'},
+                {'type': 'pending', 'original_text': '6月補@6/14白班',
+                 'target_date': datetime, 'target_slot_type': 'sun_day'},
             ],
             ...
         }
@@ -1380,7 +1446,22 @@ def read_cross_month_makeup_holidays_from_excel(
                 return 'weekday_holiday_night'
         return None
 
+    def _cross_month_skip_column(col_pos: int) -> int:
+        # 上月最後一個假日欄承接本月第一個假日區塊，輸出時落在本月假日第 1 欄。
+        if col_pos == len(holiday_cols):
+            return 1
+        return col_pos
+
+    def _pending_makeup_column(col_pos: int) -> int:
+        # 「X月補」不是原欄位保留，而是上月待補班在本月找位置補。
+        # 若它寫在上月最後一個假日欄，本月輸出從第 2 欄承接，避免壓到第一個假日欄。
+        if col_pos == len(holiday_cols):
+            return 2 if len(holiday_cols) >= 4 else 1
+        return _cross_month_skip_column(col_pos)
+
     nurse_makeups = {}
+    prev_month = target_month - 1 if target_month > 1 else 12
+    prev_year = target_year if target_month > 1 else target_year - 1
 
     for row_idx in range(header_row + 1, ws.max_row + 1):
         name_cell = ws.cell(row=row_idx, column=name_col).value
@@ -1391,26 +1472,107 @@ def read_cross_month_makeup_holidays_from_excel(
         if not name:
             continue
 
-        for col_idx in holiday_cols:
+        first_holiday_text = ''
+        if holiday_cols:
+            first_holiday_value = ws.cell(row=row_idx, column=holiday_cols[0]).value
+            first_holiday_text = str(first_holiday_value).strip() if first_holiday_value is not None else ''
+
+        for col_pos, col_idx in enumerate(holiday_cols, 1):
             cell_value = ws.cell(row=row_idx, column=col_idx).value
             if not cell_value:
                 continue
 
             text = str(cell_value).strip()
 
-            # --- 格式1：純待補班「X月補」---
-            pending_match = re.match(r'^(\d+)月補$', text)
+            # 上月表第一個假日欄若已標示「-」，代表這個月左表第一格要保留為空班。
+            if text == '-' and col_pos == 1:
+                if name not in nurse_makeups:
+                    nurse_makeups[name] = []
+                nurse_makeups[name].append({
+                    'type': 'skip',
+                    'original_text': '-',
+                    'column_index': 1,
+                })
+                print(f"  讀取跨月跳過記錄: {name} {text}")
+                continue
+
+            # --- 格式1：待補班「X月補」，可選指定日期：「X月補@M/D班別」或「X月補 M/D班別」---
+            pending_match = re.match(r'^(\d+)月補(?:[@\s]+(\d{1,2})/(\d{1,2})\s*(白班|小夜|大夜)?)?$', text)
             if pending_match:
                 month_num = int(pending_match.group(1))
                 if month_num == target_month:
+                    target_date = None
+                    target_slot_type = None
+                    target_shift_type = None
+                    if pending_match.group(2) and pending_match.group(3):
+                        preferred_month = int(pending_match.group(2))
+                        preferred_day = int(pending_match.group(3))
+                        target_shift_type = pending_match.group(4)
+                        if preferred_month == target_month:
+                            try:
+                                target_date = datetime(target_year, preferred_month, preferred_day)
+                                if target_shift_type:
+                                    target_slot_type = _parse_slot_type(target_date, target_shift_type)
+                                    if not target_slot_type:
+                                        target_date = None
+                            except ValueError:
+                                target_date = None
+                                target_slot_type = None
+                    if name not in nurse_makeups:
+                        nurse_makeups[name] = []
+                    pending_record = {
+                        'type': 'pending',
+                        'original_text': text,
+                        'column_index': _pending_makeup_column(col_pos),
+                    }
+                    if target_date:
+                        pending_record['target_date'] = target_date
+                    if target_slot_type:
+                        pending_record['target_slot_type'] = target_slot_type
+                    if target_shift_type:
+                        pending_record['target_shift_type'] = target_shift_type
+                    nurse_makeups[name].append(pending_record)
+                    print(f"  讀取假日待補班: {name} {text}")
+                continue
+
+            # --- 格式1.5：上月最後假日欄的 P/換心/原班，帶到本月對應欄位當跳過記錄 ---
+            prev_identity_match = re.match(rf'^({prev_month})月(大P1|小P1|大P2|小P2|換心)$', text)
+            if prev_identity_match:
+                if col_pos == len(holiday_cols):
                     if name not in nurse_makeups:
                         nurse_makeups[name] = []
                     nurse_makeups[name].append({
-                        'type': 'pending',
+                        'type': 'skip',
                         'original_text': text,
+                        'column_index': _cross_month_skip_column(col_pos),
                     })
-                    print(f"  讀取假日待補班: {name} {text}")
+                    print(f"  讀取跨月跳過記錄: {name} {text}")
                 continue
+
+            prev_shift_match = re.match(r'^(\d+)/(\d+)\s*(白班|小夜|大夜)$', text)
+            if prev_shift_match:
+                month_num = int(prev_shift_match.group(1))
+                day = int(prev_shift_match.group(2))
+                if month_num == prev_month and col_pos == len(holiday_cols):
+                    try:
+                        datetime(prev_year, month_num, day)
+                    except ValueError:
+                        continue
+                    if name not in nurse_makeups:
+                        nurse_makeups[name] = []
+                    nurse_makeups[name].append({
+                        'type': 'skip',
+                        'original_text': text,
+                        'column_index': _cross_month_skip_column(col_pos),
+                    })
+                    if len(holiday_cols) >= 4:
+                        nurse_makeups[name].append({
+                            'type': 'skip',
+                            'original_text': text,
+                            'column_index': 2,
+                        })
+                    print(f"  讀取跨月跳過記錄: {name} {text}")
+                    continue
 
             # --- 格式2：有日期有班別「6/7白班」或舊格式「!6/7白班」---
             content = text.lstrip('!').strip()

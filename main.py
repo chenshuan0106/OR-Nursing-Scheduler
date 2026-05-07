@@ -10,6 +10,7 @@
 import sys
 import os
 import re
+from datetime import datetime
 from typing import List, Dict, Tuple, Optional, Any
 
 import config
@@ -167,8 +168,18 @@ def build_pre_schedule_check(
     cross_month_makeups = read_cross_month_makeup_holidays_from_excel(filepath, sheet_name, month, year)
     previous_entries = _read_previous_entries_by_nurse(filepath, sheet_name)
     carryover_by_nurse = {}
+    carryover_records_by_nurse = {}
     for nurse_name, records in cross_month_makeups.items():
         carryover_by_nurse[nurse_name] = [record.get('original_text', '') for record in records if record.get('original_text')]
+        indexed_records = []
+        pending_index = 0
+        for record in records:
+            record_copy = dict(record)
+            if record_copy.get('type') == 'pending':
+                record_copy['pending_index'] = pending_index
+                pending_index += 1
+            indexed_records.append(record_copy)
+        carryover_records_by_nurse[nurse_name] = indexed_records
 
     return {
         'sheet_name': sheet_name,
@@ -176,6 +187,7 @@ def build_pre_schedule_check(
         'month': month,
         'nurses': nurses,
         'carryover_by_nurse': carryover_by_nurse,
+        'carryover_records_by_nurse': carryover_records_by_nurse,
         'previous_entries': previous_entries,
         'last_night': last_night or '',
         'last_small_night': last_small_night or '',
@@ -184,6 +196,40 @@ def build_pre_schedule_check(
         'next_small_night': _get_next_nurse_name(nurses, last_small_night),
         'next_holiday': _get_next_nurse_name(nurses, last_holiday),
     }
+
+
+def _holiday_makeup_override_key(nurse_name: str, record: Dict, pending_index: int) -> str:
+    return f"{nurse_name}|{record.get('original_text', '')}|{record.get('column_index') or 1}|{pending_index}"
+
+
+def _apply_holiday_makeup_overrides(
+    cross_month_makeups: Dict[str, List[Dict]],
+    holiday_makeup_date_overrides: Optional[Dict[str, Dict]],
+) -> None:
+    if not holiday_makeup_date_overrides:
+        return
+
+    for nurse_name, records in cross_month_makeups.items():
+        pending_index = 0
+        for record in records:
+            if record.get('type') != 'pending':
+                continue
+
+            override_key = _holiday_makeup_override_key(nurse_name, record, pending_index)
+            pending_index += 1
+            override = holiday_makeup_date_overrides.get(override_key)
+            if not override:
+                continue
+
+            target_date = override.get('target_date')
+            if target_date and not isinstance(target_date, datetime):
+                target_date = datetime(target_date.year, target_date.month, target_date.day)
+            if target_date:
+                record['target_date'] = target_date
+
+            target_shift_type = override.get('target_shift_type')
+            if target_shift_type:
+                record['target_shift_type'] = target_shift_type
 
 
 def print_night_shift_preview(results: List[Dict], month: int, sheet_name: str):
@@ -255,6 +301,7 @@ def process_sheet(
     last_assigned_night_name: str = None,
     last_assigned_small_night_name: str = None,
     last_assigned_holiday_name: str = None,
+    holiday_makeup_date_overrides: Optional[Dict[str, Dict]] = None,
 ) -> Tuple[List[NurseInfo], List[Dict], List[Dict], List, str, str, str, set, set]:
     """
     處理單一頁籤的排班
@@ -303,6 +350,7 @@ def process_sheet(
     print("讀取跨月補班記錄...")
     from excel_handler import read_cross_month_makeup_holidays_from_excel
     cross_month_makeups = read_cross_month_makeup_holidays_from_excel(filepath, sheet_name, month, year)
+    _apply_holiday_makeup_overrides(cross_month_makeups, holiday_makeup_date_overrides)
     
     # 填充到每個護理人員
     # cross_month_makeups 的每筆記錄有 type: 'fixed' 或 'pending'
@@ -313,13 +361,15 @@ def process_sheet(
             fixed = [r for r in records if r['type'] == 'fixed']
             if fixed:
                 nurse.previous_month_cross_month_makeup_holidays = fixed
-            # 純待補班（無日期）只放在排班前核對表提醒，不直接塞進假日輪序。
-            # 有日期的跨月班才是已確認的保留班；X月補若自動搶先補，會把本月輪序推歪。
+            skip_records = [r for r in records if r['type'] == 'skip']
+            if skip_records:
+                nurse.previous_month_holiday_skip_records = skip_records
             pending = [r for r in records if r['type'] == 'pending']
             for p in pending:
-                print(f"  {nurse.name} 有假日待補提醒（不自動排入輪序）: {p['original_text']}")
+                print(f"  {nurse.name} 有假日待補，將在有日期跨月補班後優先排入: {p['original_text']}")
             if pending:
                 nurse.holiday_pending_notice = pending
+                nurse.pending_holiday_makeup = pending
 
     # 如果沒有護理人員，直接返回空結果
     if not nurses:

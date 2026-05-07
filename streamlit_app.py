@@ -6,6 +6,7 @@ import tempfile
 import os
 import io
 import json
+import calendar
 from datetime import date, datetime
 from contextlib import redirect_stdout
 
@@ -120,6 +121,9 @@ try:
     from date_utils import roc_to_western_year
     from excel_handler import get_sheet_names, create_schedule_excel_multi_sheet
     from main import parse_title_year_month, process_sheet, build_pre_schedule_check
+    from night_shift import format_night_shift_result
+    from small_night_shift import format_small_night_shift_result
+    from holiday_shift import format_holiday_shift_result
     modules_loaded = True
 except ImportError as e:
     modules_loaded = False
@@ -139,6 +143,288 @@ if modules_loaded:
 
     if 'selected_year' not in st.session_state:
         st.session_state.selected_year = '2026'
+
+    def _nurse_name(nurse):
+        return getattr(nurse, 'name', '')
+
+    def _dates_text(dates):
+        if not dates:
+            return ''
+        return '.'.join(f"{d.month}/{d.day}" for d in dates)
+
+    def _status_tags(*items):
+        return '、'.join([item for item in items if item]) or '-'
+
+    def _manual_anchor_key(sheet_name, shift_type):
+        return f"manual_anchor_{shift_type}_{sheet_name}"
+
+    def _get_manual_anchor(sheet_name, shift_type):
+        value = st.session_state.get(_manual_anchor_key(sheet_name, shift_type), '自動判斷')
+        return None if value == '自動判斷' else value
+
+    def get_manual_anchor_overrides(sheet_name):
+        return {
+            'night': _get_manual_anchor(sheet_name, 'night'),
+            'small_night': _get_manual_anchor(sheet_name, 'small_night'),
+            'holiday': _get_manual_anchor(sheet_name, 'holiday'),
+        }
+
+    def _holiday_makeup_override_key(nurse_name, record):
+        pending_index = int(record.get('pending_index') or 0)
+        return f"{nurse_name}|{record.get('original_text', '')}|{record.get('column_index') or 1}|{pending_index}"
+
+    def _holiday_makeup_ui_key(sheet_name, nurse_name, record, field):
+        return f"holiday_makeup_{field}_{sheet_name}_{nurse_name}_{record.get('pending_index') or 0}_{record.get('column_index') or 1}"
+
+    def get_holiday_makeup_date_overrides(sheet_name, pre_check):
+        overrides = {}
+        records_by_nurse = pre_check.get('carryover_records_by_nurse', {})
+        default_min_date = date(int(pre_check.get('year')), int(pre_check.get('month')), 1)
+        for nurse_name, records in records_by_nurse.items():
+            for record in records:
+                if record.get('type') != 'pending':
+                    continue
+                enabled_key = _holiday_makeup_ui_key(sheet_name, nurse_name, record, 'enabled')
+                date_key = _holiday_makeup_ui_key(sheet_name, nurse_name, record, 'date')
+                shift_key = _holiday_makeup_ui_key(sheet_name, nurse_name, record, 'shift')
+                target_date = st.session_state.get(date_key)
+                target_shift = st.session_state.get(shift_key)
+                default_dt = record.get('target_date')
+                default_date = default_dt.date() if hasattr(default_dt, 'date') else default_min_date
+                default_shift = record.get('target_shift_type') or '自動'
+                is_enabled = st.session_state.get(enabled_key)
+                date_changed = target_date and target_date != default_date
+                shift_changed = target_shift and target_shift != default_shift
+                if not (is_enabled or date_changed or shift_changed):
+                    continue
+
+                override = {}
+                if target_date:
+                    override['target_date'] = target_date
+                if target_shift and target_shift != '自動':
+                    override['target_shift_type'] = target_shift
+                if override:
+                    overrides[_holiday_makeup_override_key(nurse_name, record)] = override
+        return overrides
+
+    def build_quality_notes(results):
+        notes = []
+        pre_check = results.get('pre_schedule_check', {})
+        nurse_names = {_nurse_name(nurse) for nurse in results.get('nurses', [])}
+        manual_overrides = results.get('manual_anchor_overrides') or {}
+
+        if not nurse_names:
+            notes.append(("error", "未讀到可排班護理人員，請檢查姓名欄位與表頭。"))
+
+        for label, key in [('大夜', 'last_night'), ('小夜週', 'last_small_night'), ('假日班', 'last_holiday')]:
+            last_name = pre_check.get(key)
+            if last_name and last_name not in nurse_names:
+                notes.append(("warning", f"{label}上月定位點 `{last_name}` 不在本月名單內，系統會從名單第一位重新推算。"))
+
+        if not results.get('night_results'):
+            notes.append(("warning", "本月沒有產生大夜班結果。"))
+        if not results.get('small_night_results'):
+            notes.append(("warning", "本月沒有產生小夜週結果。"))
+        if not results.get('holiday_results'):
+            notes.append(("info", "本月沒有產生假日班結果。"))
+
+        pending = []
+        for nurse in results.get('nurses', []):
+            for item in getattr(nurse, 'new_pending_makeup', []):
+                pending.append(f"{nurse.name}：{item.get('shift_type', '')} 原{_dates_text(item.get('dates', []))}")
+        if pending:
+            notes.append(("warning", "本月尚有待補班：" + "；".join(pending)))
+
+        night_skipped = sorted(results.get('night_identity_skipped') or [])
+        small_skipped = sorted(results.get('small_night_identity_skipped') or [])
+        if night_skipped:
+            notes.append(("info", "大夜因身分/特殊條件跳過：" + "、".join(night_skipped)))
+        if small_skipped:
+            notes.append(("info", "小夜週因身分/特殊條件跳過：" + "、".join(small_skipped)))
+
+        manual_labels = []
+        if manual_overrides.get('night'):
+            manual_labels.append(f"大夜 `{manual_overrides['night']}`")
+        if manual_overrides.get('small_night'):
+            manual_labels.append(f"小夜週 `{manual_overrides['small_night']}`")
+        if manual_overrides.get('holiday'):
+            manual_labels.append(f"假日班 `{manual_overrides['holiday']}`")
+        if manual_labels:
+            notes.append(("info", "本次使用手動定位點：" + "、".join(manual_labels)))
+
+        return notes
+
+    def render_quality_notes(results):
+        notes = build_quality_notes(results)
+        if not notes:
+            st.success("品質檢查未發現明顯異常。")
+            return
+
+        for level, message in notes:
+            if level == "error":
+                st.error(message)
+            elif level == "warning":
+                st.warning(message)
+            else:
+                st.info(message)
+
+    def render_pre_schedule_checks(pre_checks):
+        st.header("🔎 排班前檢查")
+        st.caption("先確認系統讀到的輪值定位點與跨月資料，沒問題再開始排班。")
+
+        for sheet_name, check in pre_checks.items():
+            nurses = check.get('nurses', [])
+            carryover_by_nurse = check.get('carryover_by_nurse', {})
+            previous_entries = check.get('previous_entries', {})
+
+            with st.expander(f"📄 {sheet_name}", expanded=True):
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("護理人員", len(nurses))
+                with col2:
+                    st.metric("大夜接續", check.get('next_night') or '-')
+                with col3:
+                    next_small_name = check.get('next_small_night') or '-'
+                    st.metric("小夜週接續", next_small_name)
+                with col4:
+                    st.metric("假日班接續", check.get('next_holiday') or '-')
+
+                st.markdown("**上月定位點**")
+                st.markdown(
+                    f"- 大夜: `{check.get('last_night') or '未找到'}`\n"
+                    f"- 小夜週: `{check.get('last_small_night') or '未找到'}`\n"
+                    f"- 假日班: `{check.get('last_holiday') or '未找到'}`"
+                )
+
+                st.markdown("**手動覆寫定位點（選填）**")
+                st.caption("選到的人會被視為上月最後一位，本次排班會從下一位開始。未選則使用 Excel 自動判斷。")
+                nurse_names = [nurse.name for nurse in nurses]
+                anchor_options = ['自動判斷'] + nurse_names
+                anchor_cols = st.columns(3)
+                anchor_settings = [
+                    ('大夜', 'night', check.get('last_night')),
+                    ('小夜週', 'small_night', check.get('last_small_night')),
+                    ('假日班', 'holiday', check.get('last_holiday')),
+                ]
+                for col, (label, shift_type, auto_value) in zip(anchor_cols, anchor_settings):
+                    key = _manual_anchor_key(sheet_name, shift_type)
+                    if st.session_state.get(key) not in anchor_options:
+                        st.session_state[key] = '自動判斷'
+                    with col:
+                        st.selectbox(
+                            label,
+                            options=anchor_options,
+                            key=key,
+                            help=f"目前自動判斷：{auto_value or '未找到'}",
+                        )
+
+                if carryover_by_nurse:
+                    rows = [
+                        {"姓名": name, "跨月補班/備註": "；".join(items)}
+                        for name, items in carryover_by_nurse.items()
+                    ]
+                    st.markdown("**跨月補班資料**")
+                    st.table(rows)
+
+                if carryover_by_nurse:
+                    pending_records = [
+                        (name, record)
+                        for name, records in check.get('carryover_records_by_nurse', {}).items()
+                        for record in records
+                        if record.get('type') == 'pending'
+                    ]
+                    if pending_records:
+                        st.markdown("**X月補指定日期（選填）**")
+                        st.caption("不勾指定時，維持原本自動找第一個可補格子的規則。")
+                        _, last_day = calendar.monthrange(int(check.get('year')), int(check.get('month')))
+                        min_makeup_date = date(int(check.get('year')), int(check.get('month')), 1)
+                        max_makeup_date = date(int(check.get('year')), int(check.get('month')), last_day)
+                        for nurse_name, record in pending_records:
+                            default_dt = record.get('target_date')
+                            default_date = default_dt.date() if hasattr(default_dt, 'date') else min_makeup_date
+                            default_shift = record.get('target_shift_type') or '自動'
+                            date_key = _holiday_makeup_ui_key(sheet_name, nurse_name, record, 'date')
+                            shift_key = _holiday_makeup_ui_key(sheet_name, nurse_name, record, 'shift')
+                            if st.session_state.get(date_key) is None:
+                                st.session_state[date_key] = default_date
+                            if st.session_state.get(shift_key) is None:
+                                st.session_state[shift_key] = default_shift
+
+                            col_name, col_enabled, col_date, col_shift = st.columns([2, 1, 1, 1])
+                            with col_name:
+                                st.write(f"{nurse_name}: {record.get('original_text', '')}")
+                            with col_enabled:
+                                st.checkbox(
+                                    "指定",
+                                    key=_holiday_makeup_ui_key(sheet_name, nurse_name, record, 'enabled'),
+                                )
+                            with col_date:
+                                st.date_input(
+                                    "日期",
+                                    min_value=min_makeup_date,
+                                    max_value=max_makeup_date,
+                                    key=date_key,
+                                )
+                            with col_shift:
+                                st.selectbox(
+                                    "班別",
+                                    options=['自動', '白班', '小夜', '大夜'],
+                                    key=shift_key,
+                                )
+
+                missing_previous = [nurse.name for nurse in nurses if nurse.name not in previous_entries]
+                if missing_previous:
+                    st.warning("下列人員沒有讀到既有班別欄位資料：" + "、".join(missing_previous))
+                elif nurses:
+                    st.success("已讀到所有人員的既有班別欄位資料。")
+
+    def render_shift_preview(results, month):
+        tab_night, tab_small, tab_holiday = st.tabs(["大夜", "小夜週", "假日班"])
+
+        with tab_night:
+            rows = []
+            for result in results.get('night_results', []):
+                rows.append({
+                    "日期": format_night_shift_result(result),
+                    "姓名": result['nurse'].name,
+                    "類型": "補班" if result.get('is_makeup') else "正常",
+                    "狀態": _status_tags(
+                        "下月" if result.get('is_next_month') else '',
+                        "定位點" if result.get('is_last_normal') else '',
+                    ),
+                })
+            st.table(rows or [{"日期": "-", "姓名": "-", "類型": "無資料", "狀態": "-"}])
+
+        with tab_small:
+            rows = []
+            for result in results.get('small_night_results', []):
+                rows.append({
+                    "日期": format_small_night_shift_result(result),
+                    "姓名": result['nurse'].name,
+                    "類型": "補班" if result.get('is_makeup') else "正常",
+                    "狀態": _status_tags(
+                        "下月" if result.get('is_next_month') else '',
+                        "定位點" if result.get('is_last_normal') else '',
+                    ),
+                })
+            st.table(rows or [{"日期": "-", "姓名": "-", "類型": "無資料", "狀態": "-"}])
+
+        with tab_holiday:
+            rows = []
+            for result in results.get('holiday_results', []):
+                rows.append({
+                    "班別": format_holiday_shift_result(result, month),
+                    "姓名": result.nurse.name,
+                    "欄位": result.slot.shift_name,
+                    "狀態": _status_tags(
+                        "下月" if result.slot.is_next_month else '',
+                        "補班" if result.is_makeup else '',
+                        "國假補償" if result.is_holiday_compensation else '',
+                        "跳過" if result.is_skipped else '',
+                        "定位點" if result.is_last_normal else '',
+                    ),
+                })
+            st.table(rows or [{"班別": "-", "姓名": "-", "欄位": "無資料", "狀態": "-"}])
 
     def render_last_run():
         run = st.session_state.get('last_run')
@@ -174,6 +460,12 @@ if modules_loaded:
                 st.markdown(f"- 大夜: `{results['night_last_normal']}`")
                 st.markdown(f"- 小夜週: `{results['small_night_last_normal']}`")
                 st.markdown(f"- 假日班: `{results['holiday_last_normal']}`")
+
+                st.markdown("**品質檢查：**")
+                render_quality_notes(results)
+
+                st.markdown("**結果預覽：**")
+                render_shift_preview(results, run.get('month'))
 
         st.markdown("---")
         st.header("📥 下載結果")
@@ -292,7 +584,10 @@ if modules_loaded:
         if st.button("✅ 新增假日", use_container_width=True):
             if new_name:
                 new_date_str = f"{new_month}/{new_day}"
-                if new_date_str in st.session_state.all_holidays[current_year]:
+                _, last_day = calendar.monthrange(int(current_year), new_month)
+                if new_day > last_day:
+                    st.warning(f"⚠️ {current_year}/{new_month} 沒有 {new_day} 日")
+                elif new_date_str in st.session_state.all_holidays[current_year]:
                     st.warning(f"⚠️ {new_date_str} 已存在")
                 else:
                     st.session_state.all_holidays[current_year][new_date_str] = new_name
@@ -349,22 +644,21 @@ if modules_loaded:
 
         try:
             # 解析年月
-            roc_year, month = parse_title_year_month(tmp_path)
             roc_year, input_month = parse_title_year_month(tmp_path)
-            
-            # 計算目標月份
-            if input_month == 12:
-                month = 1
-                year = roc_to_western_year(roc_year) + 1
-                roc_year += 1
-            else:
-                month = input_month + 1
-                year = roc_to_western_year(roc_year)
 
-            if roc_year is None or month is None:
+            if roc_year is None or input_month is None:
                 st.error("❌ 無法從 Excel 標題解析年份和月份")
                 st.info("請確認標題格式為: XXX年X月值班表")
             else:
+                # 計算目標月份：上傳本月值班表，系統產生下個月排班表
+                if input_month == 12:
+                    month = 1
+                    year = roc_to_western_year(roc_year) + 1
+                    roc_year += 1
+                else:
+                    month = input_month + 1
+                    year = roc_to_western_year(roc_year)
+
                 year = roc_to_western_year(roc_year)
 
                 # 顯示檔案資訊
@@ -397,6 +691,24 @@ if modules_loaded:
 
                 st.markdown("---")
 
+                pre_schedule_checks = {}
+                with st.spinner("正在建立排班前檢查..."):
+                    for sheet_name in sheet_names:
+                        try:
+                            pre_schedule_checks[sheet_name] = build_pre_schedule_check(
+                                tmp_path,
+                                sheet_name,
+                                year,
+                                month,
+                            )
+                        except Exception as e:
+                            st.error(f"建立 {sheet_name} 排班前檢查時發生錯誤: {e}")
+
+                if pre_schedule_checks:
+                    render_pre_schedule_checks(pre_schedule_checks)
+
+                st.markdown("---")
+
                 # 排班按鈕
                 if st.button("🚀 開始排班", type="primary", use_container_width=True):
 
@@ -425,12 +737,14 @@ if modules_loaded:
                         for idx, sheet_name in enumerate(sheet_names):
                             status_text.text(f"正在處理: {sheet_name} ({idx + 1}/{total_sheets})")
                             progress_bar.progress((idx + 1) / (total_sheets + 1))
-                            pre_schedule_check = build_pre_schedule_check(
+                            pre_schedule_check = pre_schedule_checks.get(sheet_name) or build_pre_schedule_check(
                                 tmp_path,
                                 sheet_name,
                                 year,
                                 month,
                             )
+                            manual_anchor_overrides = get_manual_anchor_overrides(sheet_name)
+                            holiday_makeup_date_overrides = get_holiday_makeup_date_overrides(sheet_name, pre_schedule_check)
 
                             # 捕捉這個頁籤的輸出
                             sheet_output = io.StringIO()
@@ -451,6 +765,10 @@ if modules_loaded:
                                         sheet_name,
                                         year,
                                         month,
+                                        last_assigned_night_name=manual_anchor_overrides.get('night'),
+                                        last_assigned_small_night_name=manual_anchor_overrides.get('small_night'),
+                                        last_assigned_holiday_name=manual_anchor_overrides.get('holiday'),
+                                        holiday_makeup_date_overrides=holiday_makeup_date_overrides,
                                     )
 
                                     all_results[sheet_name] = {
@@ -464,6 +782,8 @@ if modules_loaded:
                                         'night_identity_skipped': night_identity_skipped,
                                         'small_night_identity_skipped': small_night_identity_skipped,
                                         'pre_schedule_check': pre_schedule_check,
+                                        'manual_anchor_overrides': manual_anchor_overrides,
+                                        'holiday_makeup_date_overrides': holiday_makeup_date_overrides,
                                     }
                                 except Exception as e:
                                     st.error(f"處理頁籤 {sheet_name} 時發生錯誤: {e}")
@@ -500,6 +820,7 @@ if modules_loaded:
                         'output_bytes': output_bytes,
                         'output_filename': output_filename,
                         'log_text': log_output.getvalue(),
+                        'month': month,
                     }
 
                     # 清理臨時輸出檔案
