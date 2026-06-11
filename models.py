@@ -20,6 +20,7 @@ class NurseInfo:
     wedding_leave_dates: List[datetime] = field(default_factory=list)  # 婚假日期
     original_leave_text: str = ''  # 原始公休欄位文字
     remarks: str = ''  # 備註
+    makeup_text: str = ''  # 補班文字
     
     # 新增：完全免排班標記與原因
     is_exempt: bool = False
@@ -74,7 +75,7 @@ class NurseInfo:
 
         # 2. 新增邏輯：自動判斷是否「完全免排班」
         # 我們將所有的備註與公休欄位文字合併檢查，若包含任何免排班關鍵字就標記起來
-        combined_text = f"{self.remarks} {self.original_leave_text}".replace(" ", "")
+        combined_text = f"{self.remarks} {self.original_leave_text} {self.makeup_text}".replace(" ", "")
         for keyword in EXEMPT_KEYWORDS:
             if keyword in combined_text:
                 self.is_exempt = True

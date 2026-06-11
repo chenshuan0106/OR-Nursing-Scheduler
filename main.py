@@ -85,6 +85,18 @@ def _get_next_nurse_name(nurses: List[NurseInfo], last_assigned_name: str) -> st
     return nurses[(last_index + 1) % len(nurses)].name
 
 
+def _get_previous_nurse_name(nurses: List[NurseInfo], last_assigned_name: str) -> str:
+    """Get the previous nurse in list order; small night rotates upward."""
+    if not nurses:
+        return ''
+
+    last_index = find_last_assigned_index(nurses, last_assigned_name)
+    if last_index < 0:
+        return nurses[-1].name
+
+    return nurses[(last_index - 1) % len(nurses)].name
+
+
 def _read_previous_entries_by_nurse(
     filepath: str,
     sheet_name: str,
@@ -193,7 +205,7 @@ def build_pre_schedule_check(
         'last_small_night': last_small_night or '',
         'last_holiday': last_holiday or '',
         'next_night': _get_next_nurse_name(nurses, last_night),
-        'next_small_night': _get_next_nurse_name(nurses, last_small_night),
+        'next_small_night': _get_previous_nurse_name(nurses, last_small_night),
         'next_holiday': _get_next_nurse_name(nurses, last_holiday),
     }
 
@@ -293,6 +305,39 @@ def print_small_night_shift_preview(results: List[Dict], month: int, sheet_name:
         print(f"{date_str:<20} {nurse_name:<10} {mark_str}")
 
 
+def _apply_manual_makeup_entries(
+    nurses: List[NurseInfo],
+    manual_makeup_entries: Optional[List[Dict[str, Any]]],
+) -> None:
+    if not manual_makeup_entries:
+        return
+
+    from datetime import datetime as dt
+    for entry in manual_makeup_entries:
+        nurse_name = entry.get('nurse_name')
+        if not nurse_name:
+            continue
+        nurse = next((n for n in nurses if n.name == nurse_name), None)
+        if not nurse:
+            continue
+
+        shift_type = entry.get('shift_type')
+        date_value = entry.get('date')
+        if not date_value:
+            continue
+
+        note_text = entry.get('note') or '手動新增欠班'
+
+        if isinstance(date_value, dt):
+            target_date = date_value
+        else:
+            target_date = dt(date_value.year, date_value.month, date_value.day)
+
+        existing = nurse.makeup_text or ''
+        manual_note = f"{target_date.month}月補@{target_date.month}/{target_date.day}{shift_type} ({note_text})"
+        nurse.makeup_text = '\n'.join([line for line in [existing.strip(), manual_note] if line])
+
+
 def process_sheet(
     filepath: str,
     sheet_name: str,
@@ -302,6 +347,8 @@ def process_sheet(
     last_assigned_small_night_name: str = None,
     last_assigned_holiday_name: str = None,
     holiday_makeup_date_overrides: Optional[Dict[str, Dict]] = None,
+    manual_makeup_entries: Optional[List[Dict[str, Any]]] = None,
+    manual_makeup_note: str = '',
 ) -> Tuple[List[NurseInfo], List[Dict], List[Dict], List, str, str, str, set, set]:
     """
     處理單一頁籤的排班
@@ -311,6 +358,8 @@ def process_sheet(
          night_last_normal_name, small_night_last_normal_name, holiday_last_normal_name)
     """
     print(f"\n--- 處理頁籤: {sheet_name} ---")
+    if manual_makeup_note:
+        print(f"補班說明: {manual_makeup_note}")
 
     nurses_data = read_nurses_from_excel(filepath, sheet_name)
 
@@ -322,6 +371,9 @@ def process_sheet(
             nurses.append(nurse)
 
     print(f"讀取到 {len(nurses)} 位護理人員")
+
+    # 將手動新增的過去欠班紀錄套用到護理人員資料中
+    _apply_manual_makeup_entries(nurses, manual_makeup_entries)
 
     # 清除「預排」的國假補償記錄，保留「已確定」的記錄
     # 判斷方式：看小夜週的開始日期是否在上個月

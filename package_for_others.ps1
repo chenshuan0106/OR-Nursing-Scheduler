@@ -8,6 +8,7 @@ $zipPath = Join-Path $root "$packageName.zip"
 $files = @(
     "run_app.bat",
     "requirements.txt",
+    "compare_schedule.py",
     "holidays_config.json",
     "streamlit_app.py",
     "main.py",

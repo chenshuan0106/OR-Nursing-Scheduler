@@ -66,44 +66,79 @@ def extract_month_keywords(text: str) -> List[Tuple[str, str]]:
     return results
 
 
-def extract_pending_makeup(text: str, default_year: int = 2026) -> List[Dict[str, Any]]:
-    """
-    從文字中提取待補班資訊
-    格式: '待補班:2/26-2/28大夜' 或 '待補班:3/1-3/3大夜'
+def _parse_pending_makeup_token(token: str, default_year: int = 2026, column_index: int = 1) -> Optional[Dict[str, Any]]:
+    if not token or not isinstance(token, str):
+        return None
 
-    Returns:
-        [{'dates': [datetime, ...], 'shift_type': '大夜'}, ...]
-    """
-    if not text or not isinstance(text, str):
-        return []
+    original_text = token.strip()
+    if not original_text:
+        return None
 
-    results = []
+    normalized = original_text.replace(' ', '').replace('　', '')
+    normalized = re.sub(r'^(?:待補班|補班|待補|補)[:：@]?', '', normalized)
+    normalized = re.sub(r'^\d{1,2}月補@?', '', normalized)
 
-    # 匹配模式: 待補班:M/D-M/D大夜 或 待補班:M/D-M/D小夜
-    pattern = r'待補班[:\s]*(\d{1,2}/\d{1,2})\s*-\s*(\d{1,2}/\d{1,2})(大夜|小夜)'
-    matches = re.findall(pattern, text)
+    shift_match = re.search(r'(大夜|小夜|白班)$', normalized)
+    if not shift_match:
+        return None
 
-    for start_str, end_str, shift_type in matches:
-        from date_utils import parse_date_string
+    shift_type = shift_match.group(1)
+    normalized = normalized[:shift_match.start()]
 
-        start_date = parse_date_string(start_str, default_year)
-        end_date = parse_date_string(end_str, default_year)
+    dates: List[datetime] = []
+    target_date: Optional[datetime] = None
 
+    range_match = re.match(r'^(\d{1,2}/\d{1,2})-(\d{1,2}/\d{1,2})$', normalized)
+    if range_match:
+        start_date = parse_date_string(range_match.group(1), default_year)
+        end_date = parse_date_string(range_match.group(2), default_year)
         if start_date and end_date:
-            # 處理跨年的情況
             if end_date < start_date:
                 end_date = end_date.replace(year=end_date.year + 1)
-
-            dates = []
             current = start_date
             while current <= end_date:
                 dates.append(current)
                 current += timedelta(days=1)
+            target_date = dates[0] if dates else None
+    else:
+        date_match = re.search(r'(\d{1,2}/\d{1,2})', normalized)
+        if date_match:
+            dt = parse_date_string(date_match.group(1), default_year)
+            if dt:
+                dates.append(dt)
+                target_date = dt
 
-            results.append({
-                'dates': dates,
-                'shift_type': shift_type,
-            })
+    if not dates:
+        return None
+
+    return {
+        'dates': dates,
+        'shift_type': shift_type,
+        'original_text': original_text,
+        'target_date': target_date,
+        'target_shift_type': shift_type,
+        'column_index': column_index,
+    }
+
+
+def extract_pending_makeup(text: str, default_year: int = 2026) -> List[Dict[str, Any]]:
+    """
+    從文字中提取待補班資訊
+    格式: '待補班:2/26-2/28大夜' 或 '6月補@6/14白班'
+
+    Returns:
+        [{'dates': [datetime, ...], 'shift_type': '大夜', 'original_text': ..., 'target_date': ..., 'target_shift_type': ..., 'column_index': 1}, ...]
+    """
+    if not text or not isinstance(text, str):
+        return []
+
+    results: List[Dict[str, Any]] = []
+    tokens = re.split(r'[\n、;；]+', text)
+
+    for idx, token in enumerate(tokens, start=1):
+        record = _parse_pending_makeup_token(token, default_year, column_index=idx)
+        if record:
+            results.append(record)
 
     return results
 
@@ -207,7 +242,11 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
         leave_value = re.sub(r'\s{3,}', '\n', leave_value)
         nurse.remarks = remark_value
 
-    combined_text = str(original_name) + str(leave_value) + str(remark_value)
+    makeup_value = str(_get_first_value(row_data, ['補班', '待補班'])).strip()
+    if makeup_value and makeup_value != 'nan':
+        nurse.makeup_text = makeup_value
+
+    combined_text = str(original_name) + str(leave_value) + str(remark_value) + str(nurse.makeup_text)
     if any(keyword in combined_text for keyword in ['懷孕', '免輪值', '離職', '育嬰', '安胎']):
         nurse.is_exempt = True
 
@@ -216,6 +255,8 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
         field_values.append(leave_value)
     if remark_value and remark_value != 'nan':
         field_values.append(remark_value)
+    if nurse.makeup_text and nurse.makeup_text != 'nan':
+        field_values.append(nurse.makeup_text)
 
     for field_value in field_values:
         flags = check_special_flags(field_value)

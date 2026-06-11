@@ -17,6 +17,11 @@ def find_free_port():
         port = s.getsockname()[1]
     return port
 
+def is_port_available(port):
+    """檢查 localhost port 是否可用"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('localhost', port)) != 0
+
 def main():
     # 取得腳本所在目錄
     if getattr(sys, 'frozen', False):
@@ -38,8 +43,8 @@ def main():
         input("按 Enter 結束...")
         return
 
-    # 使用固定 port 8501（本機專用）
-    port = 8501
+    # 優先使用 8501；若已被占用，改用可用 port
+    port = 8501 if is_port_available(8501) else find_free_port()
     url = f"http://localhost:{port}"
 
     print("=" * 50)

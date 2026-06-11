@@ -62,6 +62,40 @@ def _sheet_pairs(actual_sheets: list[str], expected_sheets: list[str]) -> list[t
     return pairs
 
 
+def _header_columns(ws, header_name: str, header_row: int = 2) -> list[int]:
+    return [
+        col
+        for col in range(1, ws.max_column + 1)
+        if _normalize(ws.cell(row=header_row, column=col).value) == header_name
+    ]
+
+
+def _aligned_column_pairs(actual_ws, expected_ws, columns: Iterable[int] | None = None) -> list[tuple[int, int]]:
+    if columns:
+        expected_cols = list(columns)
+        is_holiday_only = expected_cols == list(range(6, 10))
+        if is_holiday_only:
+            actual_holidays = _header_columns(actual_ws, '假日')
+            expected_holidays = _header_columns(expected_ws, '假日')
+            return list(zip(actual_holidays, expected_holidays))
+        return [(col, col) for col in expected_cols]
+
+    pairs = []
+    used_actual: set[int] = set()
+    for expected_col in range(1, expected_ws.max_column + 1):
+        expected_header = _normalize(expected_ws.cell(row=2, column=expected_col).value)
+        if not expected_header:
+            continue
+
+        candidates = _header_columns(actual_ws, expected_header)
+        actual_col = next((col for col in candidates if col not in used_actual), None)
+        if actual_col is None:
+            actual_col = expected_col
+        used_actual.add(actual_col)
+        pairs.append((actual_col, expected_col))
+    return pairs
+
+
 def compare_workbooks(
     actual_path: Path,
     expected_path: Path,
@@ -82,7 +116,7 @@ def compare_workbooks(
             actual_ws = actual_wb[actual_sheet]
             expected_ws = expected_wb[expected_sheet]
 
-            cols = list(columns) if columns else list(range(1, max(actual_ws.max_column, expected_ws.max_column) + 1))
+            col_pairs = _aligned_column_pairs(actual_ws, expected_ws, columns)
             sheet_diffs = []
             format_only_diffs = 0
 
@@ -91,23 +125,24 @@ def compare_workbooks(
                 actual_name = _normalize(actual_ws.cell(row=row, column=1).value)
                 expected_name = _normalize(expected_ws.cell(row=row, column=1).value)
 
-                for col in cols:
-                    actual_value = _normalize(actual_ws.cell(row=row, column=col).value)
-                    expected_value = _normalize(expected_ws.cell(row=row, column=col).value)
+                for actual_col, expected_col in col_pairs:
+                    actual_value = _normalize(actual_ws.cell(row=row, column=actual_col).value)
+                    expected_value = _normalize(expected_ws.cell(row=row, column=expected_col).value)
                     if actual_value != expected_value:
                         is_format_only = _canonical(actual_value) == _canonical(expected_value)
                         if is_format_only:
                             format_only_diffs += 1
-                        sheet_diffs.append((row, col, actual_name, expected_name, actual_value, expected_value, is_format_only))
+                        sheet_diffs.append((row, actual_col, expected_col, actual_name, expected_name, actual_value, expected_value, is_format_only))
 
             total_diffs += len(sheet_diffs)
             material_diffs = len(sheet_diffs) - format_only_diffs
             detail = f', format_only={format_only_diffs}, material={material_diffs}' if classify_format else ''
             print(f'\n[{actual_sheet} vs {expected_sheet}] diffs={len(sheet_diffs)}{detail}')
-            for row, col, actual_name, expected_name, actual_value, expected_value, is_format_only in sheet_diffs[:120]:
+            for row, actual_col, expected_col, actual_name, expected_name, actual_value, expected_value, is_format_only in sheet_diffs[:120]:
                 name_text = actual_name or expected_name or f'row {row}'
                 tag = ' [format]' if classify_format and is_format_only else ''
-                print(f'  R{row}C{col} {name_text}: actual={actual_value!r} expected={expected_value!r}{tag}')
+                col_text = f'C{actual_col}' if actual_col == expected_col else f'C{actual_col}->C{expected_col}'
+                print(f'  R{row}{col_text} {name_text}: actual={actual_value!r} expected={expected_value!r}{tag}')
             if len(sheet_diffs) > 120:
                 print(f'  ... {len(sheet_diffs) - 120} more')
 
@@ -138,6 +173,10 @@ def _collect_holiday_entries(ws, columns: Iterable[int]) -> dict[str, list[str]]
     return entries
 
 
+def _holiday_columns(ws) -> list[int]:
+    return _header_columns(ws, '假日')
+
+
 def summarize_holiday_diffs(actual_path: Path, expected_path: Path, source_path: Path | None = None) -> int:
     actual_wb = load_workbook(actual_path, data_only=False)
     expected_wb = load_workbook(expected_path, data_only=False)
@@ -150,13 +189,13 @@ def summarize_holiday_diffs(actual_path: Path, expected_path: Path, source_path:
             actual_ws = actual_wb[actual_sheet]
             expected_ws = expected_wb[expected_sheet]
 
-            actual_entries = _collect_holiday_entries(actual_ws, range(6, 10))
-            expected_entries = _collect_holiday_entries(expected_ws, range(6, 10))
+            actual_entries = _collect_holiday_entries(actual_ws, _holiday_columns(actual_ws))
+            expected_entries = _collect_holiday_entries(expected_ws, _holiday_columns(expected_ws))
             source_entries = {}
             if source_wb:
                 source_sheet = next((name for name in source_wb.sheetnames if expected_sheet in name or name in actual_sheet), None)
                 if source_sheet:
-                    source_entries = _collect_holiday_entries(source_wb[source_sheet], range(5, 9))
+                    source_entries = _collect_holiday_entries(source_wb[source_sheet], _holiday_columns(source_wb[source_sheet]))
 
             keys = sorted(set(actual_entries) | set(expected_entries), key=_entry_sort_key)
 
@@ -193,7 +232,9 @@ def print_holiday_rounds(actual_path: Path, expected_path: Path) -> int:
             actual_ws = actual_wb[actual_sheet]
             expected_ws = expected_wb[expected_sheet]
             print(f'\n[{actual_sheet} vs {expected_sheet}]')
-            for round_num, col in enumerate(range(6, 10), 1):
+            actual_holiday_cols = _holiday_columns(actual_ws)
+            expected_holiday_cols = _holiday_columns(expected_ws)
+            for round_num, (actual_col, expected_col) in enumerate(zip(actual_holiday_cols, expected_holiday_cols), 1):
                 print(f'  ROUND {round_num}')
                 rows = []
                 max_row = max(actual_ws.max_row, expected_ws.max_row)
@@ -201,8 +242,8 @@ def print_holiday_rounds(actual_path: Path, expected_path: Path) -> int:
                     name = _normalize(actual_ws.cell(row=row, column=1).value) or _normalize(expected_ws.cell(row=row, column=1).value)
                     if not name:
                         continue
-                    actual_value = _normalize(actual_ws.cell(row=row, column=col).value)
-                    expected_value = _normalize(expected_ws.cell(row=row, column=col).value)
+                    actual_value = _normalize(actual_ws.cell(row=row, column=actual_col).value)
+                    expected_value = _normalize(expected_ws.cell(row=row, column=expected_col).value)
                     if actual_value or expected_value:
                         rows.append((name, actual_value, expected_value))
                         if actual_value != expected_value:

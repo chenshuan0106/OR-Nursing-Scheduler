@@ -214,9 +214,6 @@ def schedule_small_night_shifts(
                 makeup_queue.append((idx, makeup_info['dates']))
                 print(f"  從備註讀取待補班: {nurse.name} (原本 {format_dates_to_dot_string(makeup_info['dates'])})")
 
-    # 追蹤每人跳過次數（用於「每人只能跳過一次」規則）
-    skip_count = {nurse.name: 0 for nurse in nurses}
-
     # 因身分別被跳過的護理人員（用於 Excel 顯示）
     identity_skipped_nurses = set()
     
@@ -267,14 +264,6 @@ def schedule_small_night_shifts(
                 nurse, group_dates, target_month, target_year, prev_month, next_month
             )
             
-            # 每人只能跳過一次（非補班原因）：如果已經跳過一次且原因不是「公休中」或「大夜重疊」，則不跳過
-            original_reason = reason
-            if should_skip and reason not in ['公休中', '大夜重疊']:
-                if skip_count.get(nurse.name, 0) >= 1:
-                    should_skip = False
-                    reason = ''
-                    print(f"  強制排班 {nurse.name} (已跳過一次，不再跳過)")
-
             if not should_skip:
                 holiday_dates = [d for d in group_dates if is_holiday(d)]
                 has_holiday = len(holiday_dates) > 0

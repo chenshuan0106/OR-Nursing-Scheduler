@@ -7,6 +7,7 @@ import os
 import webbrowser
 import threading
 import time
+import socket
 
 def get_exe_dir():
     """取得 exe 所在目錄（用於儲存 holidays_config.json）"""
@@ -27,6 +28,18 @@ def open_browser(port):
     """延遲開啟瀏覽器"""
     time.sleep(3)
     webbrowser.open(f'http://localhost:{port}')
+
+def find_free_port():
+    """找一個可用的 port"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        s.listen(1)
+        return s.getsockname()[1]
+
+def is_port_available(port):
+    """檢查 localhost port 是否可用"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(('localhost', port)) != 0
 
 def main():
     exe_dir = get_exe_dir()
@@ -57,7 +70,7 @@ def main():
     print("【重要】關閉此視窗即可停止服務")
     print("=" * 50)
 
-    port = 8501
+    port = 8501 if is_port_available(8501) else find_free_port()
 
     # 在背景開啟瀏覽器
     browser_thread = threading.Thread(target=open_browser, args=(port,))

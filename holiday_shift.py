@@ -93,6 +93,195 @@ class HolidayShiftResult:
     skip_reason: str = ''            # 跳過原因（公休、P/換心、國定假日補償等）
 
 
+def _schedule_holiday_shifts_phased(
+    nurses: List[NurseInfo],
+    all_slots: List[HolidayShiftSlot],
+    target_year: int,
+    target_month: int,
+    last_assigned_index: int,
+) -> Tuple[List[HolidayShiftResult], str]:
+    """Three-phase holiday scheduling: fixed date, undated makeup, normal rotation."""
+    results: List[HolidayShiftResult] = []
+    used_compensations: Dict[str, List[datetime]] = {}
+    current_index = (last_assigned_index + 1) % len(nurses)
+    cycle = 0
+    last_normal_assigned_name = ''
+
+    def advance_index(idx: int) -> int:
+        nonlocal cycle
+        idx = (idx + 1) % len(nurses)
+        if idx == 0:
+            cycle += 1
+        return idx
+
+    def key(slot: HolidayShiftSlot):
+        return (slot.date.date(), slot.shift_type_id)
+
+    def occupies(result: HolidayShiftResult) -> bool:
+        return not result.is_skipped or result.is_cross_month_makeup or result.is_makeup
+
+    def taken(slot: HolidayShiftSlot) -> bool:
+        slot_key = key(slot)
+        return any(key(result.slot) == slot_key and occupies(result) for result in results)
+
+    def find_slot(record: Dict) -> Optional[HolidayShiftSlot]:
+        target_date = record.get('date') or record.get('target_date')
+        target_slot_type = record.get('slot_type') or record.get('target_slot_type')
+        target_shift_type = record.get('shift_type') or record.get('target_shift_type')
+        if not target_date:
+            return None
+        target_day = target_date.date() if hasattr(target_date, 'date') else target_date
+        for slot in all_slots:
+            slot_day = slot.date.date() if hasattr(slot.date, 'date') else slot.date
+            if slot_day != target_day:
+                continue
+            if target_slot_type and slot.shift_type_id != target_slot_type:
+                continue
+            if target_shift_type and slot.shift_name != target_shift_type:
+                continue
+            return slot
+        return None
+
+    def can_assign(nurse: NurseInfo, slot: HolidayShiftSlot) -> bool:
+        skip_info = check_should_skip_holiday_shift(nurse, slot, results, target_year, used_compensations)
+        if skip_info.should_skip:
+            return False
+        has_small_night_conflict, _ = check_small_night_week_conflict(nurse, slot)
+        has_weekend_conflict, _ = check_same_weekend_conflict(nurse, slot, results)
+        has_night_conflict, _ = check_night_shift_conflict(nurse, slot)
+        return not (has_small_night_conflict or has_weekend_conflict or has_night_conflict)
+
+    fixed_records = []
+    pending_records = []
+    skip_records = []
+    for nurse_idx, nurse in enumerate(nurses):
+        for record in getattr(nurse, 'previous_month_cross_month_makeup_holidays', []):
+            if record.get('type') == 'fixed':
+                fixed_records.append((nurse_idx, record))
+            elif record.get('type') == 'pending':
+                pending_records.append((nurse_idx, record))
+        for record in getattr(nurse, 'pending_holiday_makeup', []):
+            pending_records.append((nurse_idx, record))
+        for record in getattr(nurse, 'previous_month_holiday_skip_records', []):
+            skip_records.append((nurse_idx, record))
+
+    first_current_slot = next((slot for slot in all_slots if not slot.is_next_month), all_slots[0])
+    for nurse_idx, record in skip_records:
+        nurse = nurses[nurse_idx]
+        results.append(HolidayShiftResult(
+            slot=first_current_slot,
+            nurse=nurse,
+            column_index=int(record.get('column_index') or 1),
+            is_skipped=True,
+            skip_reason=record.get('original_text') or '',
+            original_slot_text='上月欄位保留',
+        ))
+
+    print("\n=== 假日班三階段排班 ===")
+    print("階段1：有日期者先固定")
+    dated_pending = [(idx, record) for idx, record in pending_records if record.get('target_date')]
+
+    for nurse_idx, record in fixed_records + dated_pending:
+        nurse = nurses[nurse_idx]
+        slot = find_slot(record)
+        if not slot or taken(slot):
+            continue
+        column_index = int(record.get('column_index') or 1)
+        results.append(HolidayShiftResult(
+            slot=slot,
+            nurse=nurse,
+            column_index=column_index,
+            is_makeup=record.get('type') == 'pending',
+            is_cross_month_makeup=record.get('type') == 'fixed',
+            original_slot_text=record.get('original_text') or '',
+        ))
+        print(f"  固定: {nurse.name} {slot.display_text}")
+
+    print("階段2：補沒有日期的 X月補")
+    for nurse_idx, record in [(idx, record) for idx, record in pending_records if not record.get('target_date')]:
+        nurse = nurses[nurse_idx]
+        assigned = False
+        for slot in all_slots:
+            if taken(slot):
+                continue
+            if can_assign(nurse, slot):
+                results.append(HolidayShiftResult(
+                    slot=slot,
+                    nurse=nurse,
+                    column_index=int(record.get('column_index') or 1),
+                    is_makeup=True,
+                    original_slot_text=record.get('original_text') or f'{target_month}月補',
+                ))
+                print(f"  補班: {nurse.name} {slot.display_text}")
+                assigned = True
+                break
+        if not assigned:
+            next_month = target_month + 1 if target_month < 12 else 1
+            results.append(HolidayShiftResult(
+                slot=first_current_slot,
+                nurse=nurse,
+                column_index=int(record.get('column_index') or 1),
+                is_skipped=True,
+                skip_reason=f'{next_month}月補',
+            ))
+
+    print("階段3：依定位點照格子填")
+    for slot in all_slots:
+        if taken(slot):
+            continue
+        attempts = 0
+        while attempts < len(nurses):
+            nurse = nurses[current_index]
+            skip_info = check_should_skip_holiday_shift(nurse, slot, results, target_year, used_compensations)
+            if skip_info.should_skip:
+                if skip_info.is_compensation:
+                    compensation = get_holiday_compensation_for_slot(nurse, slot, used_compensations)
+                    if compensation and slot.date.date() > compensation['date'].date():
+                        used_compensations.setdefault(nurse.name, []).append(compensation['date'])
+                        results.append(HolidayShiftResult(
+                            slot=slot,
+                            nurse=nurse,
+                            column_index=cycle + 1,
+                            is_skipped=True,
+                            skip_reason=skip_info.reason,
+                            is_holiday_compensation=True,
+                            compensation_date=compensation['date'],
+                            compensation_shift_type=compensation['shift_type'],
+                        ))
+                elif not skip_info.need_find_next:
+                    results.append(HolidayShiftResult(
+                        slot=slot,
+                        nurse=nurse,
+                        column_index=cycle + 1,
+                        is_skipped=True,
+                        skip_reason='-' if skip_info.reason in ['公休', '婚假'] else skip_info.reason,
+                    ))
+                current_index = advance_index(current_index)
+                attempts += 1
+                continue
+
+            if not can_assign(nurse, slot):
+                current_index = advance_index(current_index)
+                attempts += 1
+                continue
+
+            results.append(HolidayShiftResult(slot=slot, nurse=nurse, column_index=cycle + 1))
+            last_normal_assigned_name = nurse.name
+            print(f"  正常: {nurse.name} {slot.display_text}")
+            current_index = advance_index(current_index)
+            break
+
+    last_normal_result = None
+    for result in results:
+        if not result.is_makeup and not result.is_holiday_compensation and not result.is_skipped:
+            last_normal_result = result
+    if last_normal_result:
+        last_normal_result.is_last_normal = True
+        last_normal_assigned_name = last_normal_result.nurse.name
+
+    return results, last_normal_assigned_name
+
+
 def get_weekend_key(date: datetime) -> str:
     """取得週末識別碼，用來判斷同一個週末"""
     iso_year, iso_week, _ = date.isocalendar()
@@ -340,6 +529,12 @@ def check_same_weekend_conflict(
         if result.slot.shift_type_id == 'weekday_holiday_day':
             continue
         
+        if (
+            result.nurse.name == nurse.name and
+            result.slot.date.date() == slot.date.date()
+        ):
+            return True, f'同一天已有{result.slot.display_text}'
+
         if result.nurse.name == nurse.name and result.slot.weekend_key == slot.weekend_key:
             return True, f'同週末已有{result.slot.display_text}'
     
@@ -581,7 +776,7 @@ def check_should_skip_holiday_shift(
         if compensation:
             return SkipInfo(
                 True,
-                f"??????({compensation['date'].month}/{compensation['date'].day}{compensation['shift_type']})",
+                f"國假補償({compensation['date'].month}/{compensation['date'].day}{compensation['shift_type']})",
                 False,
                 is_compensation=True
             )
@@ -621,7 +816,6 @@ def schedule_holiday_shifts(
     
     print(f"\n開始假日班排班...")
     print(f"共 {len(all_slots)} 個假日班時段")
-    
     # 先處理跨月補班記錄（!開頭的）
     print("\n處理跨月補班記錄（!標記）...")
     cross_month_makeup_slots = {}  # {(date, slot_type): nurse_name}
@@ -707,7 +901,19 @@ def schedule_holiday_shifts(
     # 追蹤每個人本月是否已經有排過假日班
     assigned_this_month: Set[str] = set()
 
+    def has_same_day_assignment(nurse: NurseInfo, slot: HolidayShiftSlot) -> bool:
+        return any(
+            result.nurse.name == nurse.name
+            and not result.is_skipped
+            and result.slot.date.date() == slot.date.date()
+            for result in results
+        )
+
     def can_assign_makeup(nurse: NurseInfo, slot: HolidayShiftSlot) -> bool:
+        if has_same_day_assignment(nurse, slot):
+            print(f"  補班暫不排 {nurse.name}: 同一天已有假日班")
+            return False
+
         skip_info = check_should_skip_holiday_shift(
             nurse, slot, results, target_year, used_compensations
         )
@@ -734,7 +940,7 @@ def schedule_holiday_shifts(
 
     # 從上個月帶來的「X月補」純待補班 → 固定跨月補班處理完後優先排班
     print("\n處理上月帶來的假日待補班（X月補）...")
-    pending_priority_queue: List[Tuple[int, int, str, Optional[datetime], Optional[str], Optional[str]]] = []
+    pending_priority_queue: List[Tuple[int, int, str, Optional[datetime], Optional[str], Optional[str], bool]] = []
     for nurse in nurses:
         pending_records = getattr(nurse, 'pending_holiday_makeup', None) or getattr(nurse, 'holiday_pending_notice', [])
         if pending_records:
@@ -745,8 +951,34 @@ def schedule_holiday_shifts(
                 target_date = record.get('target_date')
                 target_slot_type = record.get('target_slot_type')
                 target_shift_type = record.get('target_shift_type')
-                pending_priority_queue.append((nurse_idx, column_index, original_text, target_date, target_slot_type, target_shift_type))
+                is_manual = bool(record.get('is_manual'))
+                pending_priority_queue.append((nurse_idx, column_index, original_text, target_date, target_slot_type, target_shift_type, is_manual))
                 print(f"  {nurse.name} 加入假日補班優先佇列（{original_text}，欄{column_index}）")
+
+    manual_slots = []
+    for _nurse_idx, _column_index, _original_text, target_date, _target_slot_type, target_shift_type, is_manual in pending_priority_queue:
+        if not (is_manual and target_date and target_shift_type):
+            continue
+        target_day = target_date.date() if hasattr(target_date, 'date') else target_date
+        has_slot = any(
+            (slot.date.date() if hasattr(slot.date, 'date') else slot.date) == target_day
+            and slot.shift_name == target_shift_type
+            for slot in all_slots
+        )
+        if has_slot:
+            continue
+        manual_slots.append(HolidayShiftSlot(
+            date=target_date,
+            shift_type_id=f"manual_{target_shift_type}",
+            shift_name=target_shift_type,
+            weekday=target_date.weekday(),
+            weekend_key=get_weekend_key(target_date),
+            is_next_month=target_date.month != target_month,
+        ))
+    if manual_slots:
+        slot_order = {item['id']: item['order'] for item in HOLIDAY_SHIFT_TYPES}
+        all_slots.extend(manual_slots)
+        all_slots.sort(key=lambda slot: (slot.date, slot_order.get(slot.shift_type_id, 99)))
     
     for slot in all_slots:
         # 0. 先檢查這個時段是否被跨月補班佔用
@@ -764,6 +996,10 @@ def schedule_holiday_shifts(
             nurse_name = cross_month_makeup_slots[slot_key]
             nurse = next((n for n in nurses if n.name == nurse_name), None)
             if nurse:
+                if has_same_day_assignment(nurse, slot):
+                    print(f"  跳過跨月固定班 {nurse.name} {slot.display_text}: 同一天已有假日班")
+                    nurse = None
+            if nurse:
                 result = HolidayShiftResult(
                     slot=slot,
                     nurse=nurse,
@@ -779,7 +1015,7 @@ def schedule_holiday_shifts(
 
         # 1. 上月帶來的「X月補」優先補班：固定跨月日期班排完後，先找第一個不衝突的格子
         if pending_priority_queue:
-            for pending_idx, (nurse_idx, column_index, original_text, target_date, target_slot_type, target_shift_type) in enumerate(list(pending_priority_queue)):
+            for pending_idx, (nurse_idx, column_index, original_text, target_date, target_slot_type, target_shift_type, is_manual) in enumerate(list(pending_priority_queue)):
                 if target_date:
                     if slot.date.date() != target_date.date():
                         continue
@@ -788,7 +1024,10 @@ def schedule_holiday_shifts(
                     if target_shift_type and slot.shift_name != target_shift_type:
                         continue
                 nurse = nurses[nurse_idx]
-                if can_assign_makeup(nurse, slot):
+                if has_same_day_assignment(nurse, slot):
+                    print(f"  跳過 {nurse.name} {slot.display_text}: 同一天已有假日班")
+                    continue
+                if is_manual or can_assign_makeup(nurse, slot):
                     results.append(HolidayShiftResult(
                         slot=slot,
                         nurse=nurse,
@@ -798,9 +1037,9 @@ def schedule_holiday_shifts(
                     ))
                     assigned_this_month.add(nurse.name)
                     pending_priority_queue.pop(pending_idx)
-                    if not slot.is_next_month:
-                        last_normal_assigned_name = nurse.name
-                    print(f"  ★ 優先補班: {nurse.name} {slot.display_text} (原{original_text}) [欄{column_index}]")
+                    last_normal_assigned_name = nurse.name
+                    force_text = "手動指定" if is_manual else "優先補班"
+                    print(f"  ★ {force_text}: {nurse.name} {slot.display_text} (原{original_text}) [欄{column_index}]")
                     assigned = True
                     break
             if assigned:
@@ -825,8 +1064,7 @@ def schedule_holiday_shifts(
                 ))
                 assigned_this_month.add(nurse.name)
                 deferred_priority_queue.pop(0)
-                if not slot.is_next_month:
-                    last_normal_assigned_name = nurse.name
+                last_normal_assigned_name = nurse.name
                 print(f"  ★ 延後跨月補班: {nurse.name} {slot.display_text}")
                 assigned = True
                 continue
@@ -847,8 +1085,7 @@ def schedule_holiday_shifts(
                 ))
                 assigned_this_month.add(nurse.name)
                 deferred_small_night_queue.pop(0)
-                if not slot.is_next_month:
-                    last_normal_assigned_name = nurse.name
+                last_normal_assigned_name = nurse.name
                 print(f"  ★ 跨月大夜改補小夜: {nurse.name} {slot.display_text}")
                 assigned = True
                 continue
@@ -891,7 +1128,7 @@ def schedule_holiday_shifts(
                     results.append(HolidayShiftResult(slot=slot, nurse=nurse, column_index=mq_cyc+1, is_makeup=True, original_slot_text=ot))
                     assigned_this_month.add(nurse.name)
                     makeup_queue.pop(qi)
-                    if not slot.is_next_month: last_normal_assigned_name = nurse.name
+                    last_normal_assigned_name = nurse.name
                     print(f"  ★ 隨輪序補班: {nurse.name} {slot.display_text} (原{ot})")
                     current_index = advance_index(current_index)
                     assigned = True
@@ -926,8 +1163,7 @@ def schedule_holiday_shifts(
                 assigned_this_month.add(nurse.name)
                 
                 # 記錄正常輪序最後一個人（只記錄本月的）
-                if not slot.is_next_month:
-                    last_normal_assigned_name = nurse.name
+                last_normal_assigned_name = nurse.name
                 
                 print(f"  排班: {nurse.name} {slot.display_text}")
                 
@@ -1048,8 +1284,7 @@ def schedule_holiday_shifts(
                             assigned_this_month.add(nurse.name)
 
                             # 記錄正常輪序最後一個人（只記錄本月的）
-                            if not slot.is_next_month:
-                                last_normal_assigned_name = nurse.name
+                            last_normal_assigned_name = nurse.name
 
                             print(f"  排班: {nurse.name} {slot.display_text}")
 
@@ -1087,7 +1322,7 @@ def schedule_holiday_shifts(
                     if e[0] == chosen_idx and e[1] is slot: makeup_queue.pop(qi); break
                 results.append(HolidayShiftResult(slot=slot, nurse=chosen_nurse, column_index=cycle+1))
                 assigned_this_month.add(chosen_nurse.name)
-                if not slot.is_next_month: last_normal_assigned_name = chosen_nurse.name
+                last_normal_assigned_name = chosen_nurse.name
                 print(f"  警告: 強制排班: {chosen_nurse.name} {slot.display_text}")
                 current_index = advance_index(chosen_idx)
             else:
@@ -1099,7 +1334,7 @@ def schedule_holiday_shifts(
         pending_text = f'{next_month}月補'
         fallback_slot = next((slot for slot in all_slots if not slot.is_next_month), all_slots[0])
         print(f"\n注意: 以下上月待補班本月找不到合適的班:")
-        for nurse_idx, column_index, original_text, _target_date, _target_slot_type, _target_shift_type in pending_priority_queue:
+        for nurse_idx, column_index, original_text, _target_date, _target_slot_type, _target_shift_type, _is_manual in pending_priority_queue:
             nurse = nurses[nurse_idx]
             results.append(HolidayShiftResult(
                 slot=fallback_slot,
@@ -1169,7 +1404,7 @@ def schedule_holiday_shifts(
     # 標記正常輪序最後一個班次（不含補班、不含下月、不含國假補償、不含跳過記錄）
     last_normal_result = None
     for result in results:
-        if not result.is_makeup and not result.slot.is_next_month and not result.is_holiday_compensation and not result.is_skipped:
+        if not result.is_makeup and not result.is_holiday_compensation and not result.is_skipped:
             last_normal_result = result
     
     if last_normal_result:
