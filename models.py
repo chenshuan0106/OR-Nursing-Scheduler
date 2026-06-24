@@ -1,7 +1,7 @@
 """
 護理人員資料模型
 """
-from typing import List, Dict, Any
+from typing import List, Dict
 from datetime import datetime
 from dataclasses import dataclass, field
 
@@ -31,12 +31,15 @@ class NurseInfo:
     is_age_55_plus: bool = False    # 55歲以上
     is_wedding: bool = False        # 婚嫁（整月跳過）
     is_transplant: Dict[str, bool] = field(default_factory=dict)  # {月份: True} 換心班
+    is_standby: Dict[str, bool] = field(default_factory=dict)  # {月份: True} 待命
     is_p1: Dict[str, str] = field(default_factory=dict)  # {月份: '大P1'/'小P1'} 保存大/小資訊
     is_p2: Dict[str, str] = field(default_factory=dict)  # {月份: '大P2'/'小P2'} 保存大/小資訊
     
     # 排班結果
     night_shift_dates: List[datetime] = field(default_factory=list)  # 大夜班日期
     small_night_shift_dates: List[datetime] = field(default_factory=list)  # 小夜週日期
+    manual_night_shift_dates: List[datetime] = field(default_factory=list)  # 大夜欄自填日期
+    manual_small_night_shift_dates: List[datetime] = field(default_factory=list)  # 小夜週欄自填日期
     
     # 上月跨月的排班（有#標記的）
     last_month_cross_month_night_dates: List[datetime] = field(default_factory=list)  # 上月跨月的大夜日期
@@ -52,6 +55,7 @@ class NurseInfo:
     pending_night_makeup: List[Dict] = field(default_factory=list)  # [{'dates': [...], 'shift_type': '大夜'}, ...]
     pending_small_night_makeup: List[Dict] = field(default_factory=list)  # 小夜待補班
     pending_holiday_makeup: List[Dict] = field(default_factory=list)  # 假日班待補班
+    manual_makeup_shift_blocks: List[Dict] = field(default_factory=list)  # 補班欄手動紀錄占用的日期/班別
 
     # 本月新產生的待補班（因公休跳過，輸出時寫入備註）
     new_pending_makeup: List[Dict] = field(default_factory=list)  # [{'dates': [...], 'shift_type': '大夜'}, ...]
@@ -68,6 +72,7 @@ class NurseInfo:
         # 1. 優化：確保預設為 dict/list 的欄位如果是 None，會被安全地初始化
         # (雖然 default_factory 通常不會給 None，但若從外部直接傳入 None 還是會出錯，加強防呆)
         self.is_transplant = self.is_transplant or {}
+        self.is_standby = self.is_standby or {}
         self.is_p1 = self.is_p1 or {}
         self.is_p2 = self.is_p2 or {}
         self.holiday_shift_results = self.holiday_shift_results or {}

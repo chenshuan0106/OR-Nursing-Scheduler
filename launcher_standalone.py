@@ -72,10 +72,11 @@ def main():
 
     port = 8501 if is_port_available(8501) else find_free_port()
 
-    # 在背景開啟瀏覽器
-    browser_thread = threading.Thread(target=open_browser, args=(port,))
-    browser_thread.daemon = True
-    browser_thread.start()
+    # 在背景開啟瀏覽器；測試時可用 BOR_NO_BROWSER=1 關閉自動開啟。
+    if os.environ.get('BOR_NO_BROWSER') != '1':
+        browser_thread = threading.Thread(target=open_browser, args=(port,))
+        browser_thread.daemon = True
+        browser_thread.start()
 
     # 使用 Streamlit 的內部 API 啟動
     from streamlit.web import cli as stcli

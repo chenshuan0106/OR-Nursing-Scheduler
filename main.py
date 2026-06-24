@@ -16,17 +16,15 @@ from typing import List, Dict, Tuple, Optional, Any
 import config
 from date_utils import (
     roc_to_western_year,
-    get_night_shift_groups_for_month,
     format_dates_to_dot_string,
 )
 from models import NurseInfo
 from shift_utils import parse_nurse_info_from_row
-from night_shift import schedule_night_shifts, format_night_shift_result
-from small_night_shift import schedule_small_night_shifts, format_small_night_shift_result
+from night_shift import schedule_night_shifts
+from small_night_shift import schedule_small_night_shifts
 from holiday_shift import (
     schedule_holiday_shifts,
     print_holiday_shift_preview,
-    format_holiday_shift_result,
 )
 from excel_handler import (
     read_nurses_from_excel,
@@ -336,6 +334,59 @@ def _apply_manual_makeup_entries(
         existing = nurse.makeup_text or ''
         manual_note = f"{target_date.month}月補@{target_date.month}/{target_date.day}{shift_type} ({note_text})"
         nurse.makeup_text = '\n'.join([line for line in [existing.strip(), manual_note] if line])
+        nurse.manual_makeup_shift_blocks.append({
+            'date': target_date,
+            'shift_type': shift_type,
+            'note': note_text,
+        })
+
+
+def _apply_manual_shift_entries(
+    nurses: List[NurseInfo],
+    manual_shift_entries: Optional[List[Dict[str, Any]]],
+) -> None:
+    if not manual_shift_entries:
+        return
+
+    from datetime import datetime as dt, timedelta
+
+    for entry in manual_shift_entries:
+        nurse_name = entry.get('nurse_name')
+        shift_type = entry.get('shift_type')
+        start_value = entry.get('start_date') or entry.get('date')
+        end_value = entry.get('end_date') or start_value
+        if not nurse_name or shift_type not in ('大夜', '小夜週') or not start_value:
+            continue
+
+        nurse = next((n for n in nurses if n.name == nurse_name), None)
+        if not nurse:
+            continue
+
+        def as_datetime(value):
+            if isinstance(value, dt):
+                return value
+            return dt(value.year, value.month, value.day)
+
+        start_date = as_datetime(start_value)
+        end_date = as_datetime(end_value)
+        if end_date < start_date:
+            start_date, end_date = end_date, start_date
+
+        dates = []
+        current = start_date
+        while current <= end_date:
+            dates.append(current)
+            current += timedelta(days=1)
+
+        if shift_type == '大夜':
+            nurse.manual_night_shift_dates.extend(dates)
+        else:
+            nurse.manual_small_night_shift_dates.extend(dates)
+
+        print(
+            f"  手動自填{shift_type}: {nurse.name} "
+            f"{start_date.month}/{start_date.day}-{end_date.month}/{end_date.day}"
+        )
 
 
 def process_sheet(
@@ -346,8 +397,12 @@ def process_sheet(
     last_assigned_night_name: str = None,
     last_assigned_small_night_name: str = None,
     last_assigned_holiday_name: str = None,
+    regular_start_night_name: str = None,
+    regular_start_small_night_name: str = None,
+    regular_start_holiday_name: str = None,
     holiday_makeup_date_overrides: Optional[Dict[str, Dict]] = None,
     manual_makeup_entries: Optional[List[Dict[str, Any]]] = None,
+    manual_shift_entries: Optional[List[Dict[str, Any]]] = None,
     manual_makeup_note: str = '',
 ) -> Tuple[List[NurseInfo], List[Dict], List[Dict], List, str, str, str, set, set]:
     """
@@ -374,6 +429,7 @@ def process_sheet(
 
     # 將手動新增的過去欠班紀錄套用到護理人員資料中
     _apply_manual_makeup_entries(nurses, manual_makeup_entries)
+    _apply_manual_shift_entries(nurses, manual_shift_entries)
 
     # 清除「預排」的國假補償記錄，保留「已確定」的記錄
     # 判斷方式：看小夜週的開始日期是否在上個月
@@ -439,6 +495,7 @@ def process_sheet(
 
     # 找到上個月最後排班的人的索引
     last_night_index = find_last_assigned_index(nurses, last_assigned_night_name)
+    regular_night_start_index = find_last_assigned_index(nurses, regular_start_night_name)
     if last_assigned_night_name and last_night_index >= 0:
         print(f"大夜班上個月最後排班: {last_assigned_night_name} (索引: {last_night_index})")
     elif last_assigned_night_name:
@@ -447,7 +504,7 @@ def process_sheet(
     # 執行大夜班排班
     print("開始大夜班排班...")
     night_results, night_last_normal_name, night_identity_skipped = schedule_night_shifts(
-        nurses, year, month, last_night_index
+        nurses, year, month, last_night_index, regular_start_index=regular_night_start_index
     )
 
     # 預覽大夜班結果
@@ -464,6 +521,7 @@ def process_sheet(
 
     # 找到上個月最後排班的人的索引
     last_small_night_index = find_last_assigned_index(nurses, last_assigned_small_night_name)
+    regular_small_night_start_index = find_last_assigned_index(nurses, regular_start_small_night_name)
     if last_assigned_small_night_name and last_small_night_index >= 0:
         print(f"小夜班上個月最後排班: {last_assigned_small_night_name} (索引: {last_small_night_index})")
     elif last_assigned_small_night_name:
@@ -472,7 +530,7 @@ def process_sheet(
     # 執行小夜班排班
     print("開始小夜班排班...")
     small_night_results, small_night_last_normal_name, small_night_identity_skipped = schedule_small_night_shifts(
-        nurses, year, month, last_small_night_index
+        nurses, year, month, last_small_night_index, regular_start_index=regular_small_night_start_index
     )
 
     # 預覽小夜班結果
@@ -489,6 +547,7 @@ def process_sheet(
 
     # 找到上個月最後排班的人的索引
     last_holiday_index = find_last_assigned_index(nurses, last_assigned_holiday_name)
+    regular_holiday_start_index = find_last_assigned_index(nurses, regular_start_holiday_name)
     if last_assigned_holiday_name and last_holiday_index >= 0:
         print(f"假日班上個月最後排班: {last_assigned_holiday_name} (索引: {last_holiday_index})")
     elif last_assigned_holiday_name:
@@ -497,7 +556,7 @@ def process_sheet(
     # 執行假日班排班
     print("開始假日班排班...")
     holiday_results, holiday_last_normal_name = schedule_holiday_shifts(
-        nurses, year, month, last_holiday_index
+        nurses, year, month, last_holiday_index, regular_start_index=regular_holiday_start_index
     )
 
     # 預覽假日班結果

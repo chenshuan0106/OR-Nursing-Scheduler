@@ -2,7 +2,7 @@
 Excel 讀寫處理模組
 支援大夜班、小夜週、假日班的讀取和輸出
 """
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 from openpyxl import Workbook, load_workbook
 from openpyxl.cell.rich_text import CellRichText, TextBlock
@@ -11,15 +11,12 @@ from openpyxl.styles.colors import Color
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
 import re
-import math
 import unicodedata
 
 from config import COLORS
 from date_utils import (
     is_holiday,
     is_saturday,
-    get_holiday_name,
-    format_date_to_string,
     parse_date_string,
 )
 
@@ -898,7 +895,7 @@ def _is_p_or_transplant_text(text) -> bool:
         '月大P1' in text or '月小P1' in text or
         '月大P2' in text or '月小P2' in text or
         '月P1' in text or '月P2' in text or
-        '月換心' in text
+        '月換心' in text or '月待命' in text
     )
 
 
@@ -943,8 +940,6 @@ def _write_schedule_sheet(
     """
     寫入單一頁籤的排班結果
     """
-    from small_night_shift import format_small_night_shift_result
-    
     nurses = results.get('nurses', [])
     night_results = results.get('night_results', [])
     small_night_results = results.get('small_night_results', [])
@@ -1089,6 +1084,12 @@ def _write_schedule_sheet(
                 if leave_text and label in leave_text:
                     continue
                 prev_month_labels.append((mk, label))
+        for mk, tv in getattr(nurse, 'is_standby', {}).items():
+            if mk != month_key_current and tv:
+                label = f'{mk}待命'
+                if leave_text and label in leave_text:
+                    continue
+                prev_month_labels.append((mk, label))
         # 按月份排序，讓較早的月份在前
         if prev_month_labels:
             def month_sort_key(item):
@@ -1159,7 +1160,6 @@ def _write_schedule_sheet(
                 
                 # 如果已補，從備註文字中移除
                 if makeup_key in completed_makeup_dates:
-                    from date_utils import format_dates_to_dot_string
                     first_date = min(makeup['dates'])
                     last_date = max(makeup['dates'])
                     date_range = f"{first_date.month}/{first_date.day}-{last_date.month}/{last_date.day}"
@@ -1176,7 +1176,6 @@ def _write_schedule_sheet(
         # 新產生的待補班
         if nurse.new_pending_makeup:
             for makeup in nurse.new_pending_makeup:
-                from date_utils import format_dates_to_dot_string
                 first_date = min(makeup['dates'])
                 last_date = max(makeup['dates'])
                 date_range = f"{first_date.month}/{first_date.day}-{last_date.month}/{last_date.day}"
@@ -1237,6 +1236,8 @@ def _write_schedule_sheet(
         nurse_identity = None
         if nurse.is_transplant.get(month_key):
             nurse_identity = f'{month_key}換心'
+        elif getattr(nurse, 'is_standby', {}).get(month_key):
+            nurse_identity = f'{month_key}待命'
         elif nurse.is_p1.get(month_key):
             p1_value = nurse.is_p1[month_key]
             if isinstance(p1_value, str):
@@ -1344,7 +1345,7 @@ def _write_schedule_sheet(
                     '月大P1' in holiday_text or '月小P1' in holiday_text or
                     '月大P2' in holiday_text or '月小P2' in holiday_text or
                     '月P1' in holiday_text or '月P2' in holiday_text or
-                    '月換心' in holiday_text
+                    '月換心' in holiday_text or '月待命' in holiday_text
                 )
 
                 if has_p_or_transplant_text:
@@ -1355,7 +1356,7 @@ def _write_schedule_sheet(
                     is_p_or_transplant = ('月大P1' in skip_reason or '月小P1' in skip_reason or
                                           '月大P2' in skip_reason or '月小P2' in skip_reason or
                                           '月P1' in skip_reason or '月P2' in skip_reason or
-                                          '月換心' in skip_reason)
+                                          '月換心' in skip_reason or '月待命' in skip_reason)
                     holiday_cell.font = green_font if is_p_or_transplant else black_font
                 elif first_result.slot.is_next_month or is_next_month_holiday:
                     holiday_cell.font = gray_font
@@ -1582,7 +1583,7 @@ def read_cross_month_makeup_holidays_from_excel(
                 continue
 
             # --- 格式1.5：上月最後假日欄的 P/換心/原班，帶到本月對應欄位當跳過記錄 ---
-            prev_identity_match = re.match(rf'^({prev_month})月(大P1|小P1|大P2|小P2|換心)$', text)
+            prev_identity_match = re.match(rf'^({prev_month})月(大P1|小P1|大P2|小P2|換心|待命)$', text)
             if prev_identity_match:
                 if col_pos == len(holiday_cols):
                     if name not in nurse_makeups:

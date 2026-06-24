@@ -1,4 +1,4 @@
-"""
+﻿"""
 護理排班系統 - Streamlit 網頁介面
 """
 import streamlit as st
@@ -7,7 +7,7 @@ import os
 import io
 import json
 import calendar
-from datetime import date, datetime
+from datetime import date, timedelta
 from contextlib import redirect_stdout
 
 # 設定頁面
@@ -172,6 +172,197 @@ if modules_loaded:
     def _manual_past_makeup_key(sheet_name):
         return f"manual_past_makeup_{sheet_name}"
 
+    def _manual_shift_key(sheet_name):
+        return f"manual_shift_entries_{sheet_name}"
+
+    def get_manual_shift_entries(sheet_name):
+        return list(st.session_state.get(_manual_shift_key(sheet_name), []))
+
+    def _date_span(start_date, end_date):
+        if not start_date or not end_date:
+            return []
+        first_date = min(start_date, end_date)
+        last_date = max(start_date, end_date)
+        current = first_date
+        dates = []
+        while current <= last_date:
+            dates.append(current)
+            current += timedelta(days=1)
+        return dates
+
+    def _default_manual_shift_end(start_date, shift_type, max_date):
+        days = 2 if shift_type == '大夜' else 4
+        return min(start_date + timedelta(days=days), max_date)
+
+    def _manual_shift_style(shift_type):
+        styles = {
+            '大夜': {
+                'bg': '#EAF2FF',
+                'border': '#4C7DFF',
+                'text': '#244A9B',
+                'chip_bg': '#D7E5FF',
+            },
+            '小夜週': {
+                'bg': '#EAF7EF',
+                'border': '#2F9E66',
+                'text': '#1F6B45',
+                'chip_bg': '#D5F0DF',
+            },
+        }
+        return styles.get(shift_type, styles['大夜'])
+
+    def _render_manual_shift_panel(nurse_name, shift_type, start_date, end_date, day_count):
+        style = _manual_shift_style(shift_type)
+        person = nurse_name if nurse_name != '請選擇' else '未選人員'
+        st.markdown(
+            f"""
+            <div style="
+                background:{style['bg']};
+                border-left:5px solid {style['border']};
+                border-radius:8px;
+                padding:12px 14px;
+                margin:6px 0 12px 0;
+            ">
+              <div style="font-size:13px;color:{style['text']};font-weight:700;margin-bottom:6px;">目前要固定的班</div>
+              <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                <span style="background:{style['chip_bg']};color:{style['text']};padding:4px 9px;border-radius:999px;font-size:13px;font-weight:700;">{shift_type}</span>
+                <span style="font-size:16px;font-weight:700;color:#1F2937;">{person}</span>
+                <span style="font-size:15px;color:#374151;">{start_date.strftime('%m/%d')} - {end_date.strftime('%m/%d')}</span>
+                <span style="font-size:13px;color:#6B7280;">共 {day_count} 天</span>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    def _manual_shift_card_html(item, day_count):
+        shift_type = item['shift_type']
+        style = _manual_shift_style(shift_type)
+        return f"""
+        <div style="
+            background:{style['bg']};
+            border:1px solid {style['chip_bg']};
+            border-left:5px solid {style['border']};
+            border-radius:8px;
+            padding:10px 12px;
+            min-height:54px;
+        ">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;">
+            <div>
+              <span style="font-size:15px;font-weight:700;color:#1F2937;">{item['nurse_name']}</span>
+              <span style="margin-left:8px;background:{style['chip_bg']};color:{style['text']};padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700;">{shift_type}</span>
+            </div>
+            <span style="font-size:12px;color:#6B7280;">{day_count} 天</span>
+          </div>
+          <div style="margin-top:5px;font-size:13px;color:#374151;">
+            {item['start_date'].strftime('%Y/%m/%d')} - {item['end_date'].strftime('%Y/%m/%d')}
+          </div>
+        </div>
+        """
+
+    def _manual_shift_warnings(entries, nurses):
+        warnings = []
+        occupied_dates = {}
+        nurse_by_name = {nurse.name: nurse for nurse in nurses}
+
+        for idx, entry in enumerate(entries):
+            nurse_name = entry.get('nurse_name')
+            shift_type = entry.get('shift_type')
+            start_date = entry.get('start_date')
+            end_date = entry.get('end_date')
+            entry_dates = _date_span(start_date, end_date)
+            label = f"{nurse_name} {shift_type} {start_date.strftime('%m/%d')}-{end_date.strftime('%m/%d')}"
+
+            for target_date in entry_dates:
+                date_key = target_date.strftime('%m/%d')
+                if target_date in occupied_dates:
+                    warnings.append(f"{date_key} 已同時出現在 `{occupied_dates[target_date]}` 和 `{label}`。")
+                else:
+                    occupied_dates[target_date] = label
+
+            nurse = nurse_by_name.get(nurse_name)
+            if not nurse:
+                continue
+
+            leave_dates = {d.date() for d in getattr(nurse, 'leave_dates', [])}
+            wedding_dates = {d.date() for d in getattr(nurse, 'wedding_leave_dates', [])}
+            conflict_dates = [
+                target_date for target_date in entry_dates
+                if target_date in leave_dates or target_date in wedding_dates
+            ]
+            if conflict_dates:
+                date_text = '、'.join(d.strftime('%m/%d') for d in conflict_dates)
+                warnings.append(f"`{label}` 包含 {nurse_name} 的公休/婚假：{date_text}。")
+
+            for other_idx, other in enumerate(entries):
+                if other_idx <= idx or other.get('nurse_name') != nurse_name:
+                    continue
+                overlap = set(entry_dates) & set(_date_span(other.get('start_date'), other.get('end_date')))
+                if overlap:
+                    date_text = '、'.join(d.strftime('%m/%d') for d in sorted(overlap))
+                    warnings.append(f"{nurse_name} 的手動自填互相重疊：{date_text}。")
+
+        return warnings
+
+    def _pending_makeup_rows(nurses, shift_type=None):
+        rows = []
+        for nurse in nurses:
+            pending_items = []
+            if shift_type in (None, '大夜'):
+                pending_items.extend(getattr(nurse, 'pending_night_makeup', []))
+            if shift_type in (None, '小夜'):
+                pending_items.extend(getattr(nurse, 'pending_small_night_makeup', []))
+
+            for item in pending_items:
+                rows.append({
+                    '姓名': nurse.name,
+                    '班別': item.get('shift_type') or '',
+                    '原日期': _dates_text(item.get('dates', [])),
+                    '來源': item.get('original_text') or '待補班',
+                })
+        return rows
+
+    def _group_date_ranges(dates):
+        normalized = sorted({d.date() if hasattr(d, 'date') else d for d in dates})
+        if not normalized:
+            return []
+
+        ranges = []
+        start = normalized[0]
+        prev = normalized[0]
+        for current in normalized[1:]:
+            if current == prev + timedelta(days=1):
+                prev = current
+                continue
+            ranges.append((start, prev))
+            start = current
+            prev = current
+        ranges.append((start, prev))
+        return ranges
+
+    def _excel_prefill_rows(nurses, shift_type, min_date, max_date):
+        attr_name = 'manual_night_shift_dates' if shift_type == '大夜' else 'manual_small_night_shift_dates'
+        rows = []
+        for nurse in nurses:
+            dates = [
+                d.date() if hasattr(d, 'date') else d
+                for d in getattr(nurse, attr_name, [])
+                if min_date <= (d.date() if hasattr(d, 'date') else d) <= max_date
+            ]
+            for start_date, end_date in _group_date_ranges(dates):
+                date_text = (
+                    f"{start_date.month}/{start_date.day}"
+                    if start_date == end_date
+                    else f"{start_date.month}/{start_date.day}-{end_date.month}/{end_date.day}"
+                )
+                rows.append({
+                    '姓名': nurse.name,
+                    '班別': shift_type,
+                    'Excel已寫日期': date_text,
+                    '天數': (end_date - start_date).days + 1,
+                })
+        return rows
+
     def get_manual_past_makeup_entries(sheet_name):
         entries = list(st.session_state.get(_manual_past_makeup_key(sheet_name), []))
         draft_nurse = st.session_state.get(f"past_makeup_nurse_{sheet_name}")
@@ -210,41 +401,14 @@ if modules_loaded:
         return f"holiday_makeup_{field}_{sheet_name}_{nurse_name}_{record.get('pending_index') or 0}_{record.get('column_index') or 1}"
 
     def get_holiday_makeup_date_overrides(sheet_name, pre_check):
-        overrides = {}
-        records_by_nurse = pre_check.get('carryover_records_by_nurse', {})
-        default_min_date = date(int(pre_check.get('year')), int(pre_check.get('month')), 1)
-        for nurse_name, records in records_by_nurse.items():
-            for record in records:
-                if record.get('type') != 'pending':
-                    continue
-                enabled_key = _holiday_makeup_ui_key(sheet_name, nurse_name, record, 'enabled')
-                date_key = _holiday_makeup_ui_key(sheet_name, nurse_name, record, 'date')
-                shift_key = _holiday_makeup_ui_key(sheet_name, nurse_name, record, 'shift')
-                target_date = st.session_state.get(date_key)
-                target_shift = st.session_state.get(shift_key)
-                default_dt = record.get('target_date')
-                default_date = default_dt.date() if hasattr(default_dt, 'date') else default_min_date
-                default_shift = record.get('target_shift_type') or '自動'
-                is_enabled = st.session_state.get(enabled_key)
-                date_changed = target_date and target_date != default_date
-                shift_changed = target_shift and target_shift != default_shift
-                if not (is_enabled or date_changed or shift_changed):
-                    continue
-
-                override = {}
-                if target_date:
-                    override['target_date'] = target_date
-                if target_shift and target_shift != '自動':
-                    override['target_shift_type'] = target_shift
-                if override:
-                    overrides[_holiday_makeup_override_key(nurse_name, record)] = override
-        return overrides
+        return {}
 
     def build_quality_notes(results):
         notes = []
         pre_check = results.get('pre_schedule_check', {})
         nurse_names = {_nurse_name(nurse) for nurse in results.get('nurses', [])}
         manual_overrides = results.get('manual_anchor_overrides') or {}
+        manual_shift_entries = results.get('manual_shift_entries') or []
         manual_makeup_note = (results.get('manual_makeup_note') or '').strip()
 
         if not nurse_names:
@@ -284,7 +448,19 @@ if modules_loaded:
         if manual_overrides.get('holiday'):
             manual_labels.append(f"假日班 `{manual_overrides['holiday']}`")
         if manual_labels:
-            notes.append(("info", "本次使用手動定位點：" + "、".join(manual_labels)))
+            notes.append(("info", "本次使用常規起頭：" + "、".join(manual_labels)))
+        if manual_shift_entries:
+            shift_labels = []
+            for entry in manual_shift_entries:
+                start_date = entry.get('start_date')
+                end_date = entry.get('end_date') or start_date
+                if start_date and end_date:
+                    shift_labels.append(
+                        f"{entry.get('nurse_name')} `{entry.get('shift_type')}` "
+                        f"{start_date.strftime('%m/%d')}-{end_date.strftime('%m/%d')}"
+                    )
+            if shift_labels:
+                notes.append(("info", "本次使用手動自填班：" + "、".join(shift_labels)))
 
         if manual_makeup_note:
             notes.append(("info", "本次補班說明：" + manual_makeup_note))
@@ -305,9 +481,143 @@ if modules_loaded:
             else:
                 st.info(message)
 
+    def render_manual_shift_tab(
+        sheet_name,
+        nurses,
+        nurse_names,
+        manual_shift_key,
+        shift_type,
+        min_shift_date,
+        max_shift_date_with_next,
+    ):
+        entries = st.session_state[manual_shift_key]
+        shift_entries = [item for item in entries if item.get('shift_type') == shift_type]
+        st.markdown(f"**{shift_type}自填**")
+        excel_prefill_rows = _excel_prefill_rows(nurses, shift_type, min_shift_date, max_shift_date_with_next)
+        if excel_prefill_rows:
+            with st.expander(f"Excel 已寫入的{shift_type}", expanded=True):
+                st.caption("這些已經在上傳的 Excel 欄位裡，系統會先固定並扣掉日期，不需要再手動新增一次。")
+                st.table(excel_prefill_rows)
+
+        pending_rows = _pending_makeup_rows(nurses, '大夜' if shift_type == '大夜' else '小夜')
+        if pending_rows:
+            with st.expander(f"系統已讀到的{shift_type}待補", expanded=True):
+                st.caption("這些會在排班時先補，不需要再手動自填同一段日期。")
+                st.table(pending_rows)
+
+        metric_col1, metric_col2, note_col = st.columns([1, 1, 3])
+        with metric_col1:
+            st.metric("Excel已寫", len(excel_prefill_rows))
+        with metric_col2:
+            st.metric("本次新增", len(shift_entries))
+        with note_col:
+            st.caption("指定後會先固定給該人，再排除已指定日期，剩餘日期照原輪序排。")
+
+        with st.expander(f"固定一段{shift_type}", expanded=True):
+            top_col1, top_col2, top_col3 = st.columns([2, 1, 1])
+            with top_col1:
+                selected_nurse = st.selectbox(
+                    "選擇人員",
+                    options=["請選擇"] + nurse_names,
+                    key=f"manual_shift_nurse_{shift_type}_{sheet_name}",
+                )
+            with top_col2:
+                start_key = f"manual_shift_start_{shift_type}_{sheet_name}"
+                end_key = f"manual_shift_end_{shift_type}_{sheet_name}"
+                auto_end_marker_key = f"manual_shift_auto_end_marker_{shift_type}_{sheet_name}"
+                if start_key not in st.session_state:
+                    st.session_state[start_key] = min_shift_date
+                selected_start = st.date_input(
+                    "開始日期",
+                    min_value=min_shift_date,
+                    max_value=max_shift_date_with_next,
+                    key=start_key,
+                )
+                auto_end_marker = (shift_type, selected_start)
+                if st.session_state.get(auto_end_marker_key) != auto_end_marker:
+                    st.session_state[end_key] = _default_manual_shift_end(
+                        selected_start,
+                        shift_type,
+                        max_shift_date_with_next,
+                    )
+                    st.session_state[auto_end_marker_key] = auto_end_marker
+            with top_col3:
+                selected_end = st.date_input(
+                    "結束日期",
+                    min_value=min_shift_date,
+                    max_value=max_shift_date_with_next,
+                    key=end_key,
+                )
+
+            preview_start = min(selected_start, selected_end)
+            preview_end = max(selected_start, selected_end)
+            preview_days = len(_date_span(preview_start, preview_end))
+            _render_manual_shift_panel(
+                selected_nurse,
+                shift_type,
+                preview_start,
+                preview_end,
+                preview_days,
+            )
+
+            add_col, clear_col = st.columns([1, 1])
+            with add_col:
+                if st.button(f"固定這段{shift_type}", key=f"add_manual_shift_{shift_type}_{sheet_name}", use_container_width=True):
+                    if selected_nurse == "請選擇":
+                        st.warning("請先選擇人員。")
+                    else:
+                        entry = {
+                            'nurse_name': selected_nurse,
+                            'shift_type': shift_type,
+                            'start_date': preview_start,
+                            'end_date': preview_end,
+                        }
+                        duplicate = any(
+                            item.get('nurse_name') == entry['nurse_name']
+                            and item.get('shift_type') == entry['shift_type']
+                            and item.get('start_date') == entry['start_date']
+                            and item.get('end_date') == entry['end_date']
+                            for item in st.session_state[manual_shift_key]
+                        )
+                        if duplicate:
+                            st.info("這筆自填班已存在。")
+                        else:
+                            st.session_state[manual_shift_key].append(entry)
+                            st.success(
+                                f"已固定：{selected_nurse} / {shift_type} / "
+                                f"{preview_start.strftime('%m/%d')}-{preview_end.strftime('%m/%d')}"
+                            )
+            with clear_col:
+                if st.button(f"清除本頁籤{shift_type}自填", key=f"clear_manual_shift_{shift_type}_{sheet_name}", use_container_width=True):
+                    st.session_state[manual_shift_key] = [
+                        item for item in st.session_state[manual_shift_key]
+                        if item.get('shift_type') != shift_type
+                    ]
+                    st.rerun()
+
+        if shift_entries:
+            st.markdown(f"**目前{shift_type}自填清單**")
+            manual_shift_warnings = _manual_shift_warnings(shift_entries, nurses)
+            if manual_shift_warnings:
+                st.warning("請確認：" + " ".join(manual_shift_warnings))
+            for original_idx, item in enumerate(list(st.session_state[manual_shift_key])):
+                if item.get('shift_type') != shift_type:
+                    continue
+                day_count = len(_date_span(item['start_date'], item['end_date']))
+                row_col1, row_col2 = st.columns([5, 1])
+                with row_col1:
+                    st.markdown(_manual_shift_card_html(item, day_count), unsafe_allow_html=True)
+                with row_col2:
+                    st.write("")
+                    if st.button("刪除", key=f"delete_manual_shift_{shift_type}_{sheet_name}_{original_idx}", use_container_width=True):
+                        st.session_state[manual_shift_key].pop(original_idx)
+                        st.rerun()
+        else:
+            st.info(f"目前尚未新增{shift_type}自填。")
+
     def render_pre_schedule_checks(pre_checks):
         st.header("🔎 排班前檢查")
-        st.caption("先確認系統讀到的輪值定位點與跨月資料，沒問題再開始排班。")
+        st.caption("先看總覽，有需要再進入自填班、補班或跨月資料調整。")
 
         for sheet_name, check in pre_checks.items():
             nurses = check.get('nurses', [])
@@ -315,237 +625,246 @@ if modules_loaded:
             previous_entries = check.get('previous_entries', {})
 
             with st.expander(f"📄 {sheet_name}", expanded=True):
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("護理人員", len(nurses))
-                with col2:
-                    st.metric("大夜接續", check.get('next_night') or '-')
-                with col3:
-                    next_small_name = check.get('next_small_night') or '-'
-                    st.metric("小夜週接續", next_small_name)
-                with col4:
-                    st.metric("假日班接續", check.get('next_holiday') or '-')
-
-                st.markdown("**上月定位點**")
-                st.markdown(
-                    f"- 大夜: `{check.get('last_night') or '未找到'}`\n"
-                    f"- 小夜週: `{check.get('last_small_night') or '未找到'}`\n"
-                    f"- 假日班: `{check.get('last_holiday') or '未找到'}`"
-                )
-
-                st.markdown("**手動覆寫定位點（選填）**")
-                st.caption("選到的人會被視為上月最後一位，本次排班會從下一位開始。未選則使用 Excel 自動判斷。")
                 nurse_names = [nurse.name for nurse in nurses]
-                anchor_options = ['自動判斷'] + nurse_names
-                anchor_cols = st.columns(3)
-                anchor_settings = [
-                    ('大夜', 'night', check.get('last_night')),
-                    ('小夜週', 'small_night', check.get('last_small_night')),
-                    ('假日班', 'holiday', check.get('last_holiday')),
-                ]
-                for col, (label, shift_type, auto_value) in zip(anchor_cols, anchor_settings):
-                    key = _manual_anchor_key(sheet_name, shift_type)
-                    if st.session_state.get(key) not in anchor_options:
-                        st.session_state[key] = '自動判斷'
-                    with col:
-                        st.selectbox(
-                            label,
-                            options=anchor_options,
-                            key=key,
-                            help=f"目前自動判斷：{auto_value or '未找到'}",
-                        )
+                missing_previous = [nurse.name for nurse in nurses if nurse.name not in previous_entries]
+                manual_shift_key = _manual_shift_key(sheet_name)
+                if manual_shift_key not in st.session_state:
+                    st.session_state[manual_shift_key] = []
 
-                manual_anchor_messages = []
-                for label, shift_type, _ in anchor_settings:
-                    value = st.session_state.get(_manual_anchor_key(sheet_name, shift_type))
-                    if value and value != '自動判斷':
-                        manual_anchor_messages.append(f"{label}: `{value}`")
-                if manual_anchor_messages:
-                    st.info(
-                        "手動定位點已選：" + "、".join(manual_anchor_messages) +
-                        "。系統會將此人視為上月最後一位，實際本次排班從下一位開始。"
+                def _overview_start_value(shift_type, auto_value):
+                    manual_value = st.session_state.get(_manual_anchor_key(sheet_name, shift_type), '自動判斷')
+                    return manual_value if manual_value in nurse_names else (auto_value or '-')
+
+                _, month_last_day = calendar.monthrange(int(check.get('year')), int(check.get('month')))
+                min_shift_date = date(int(check.get('year')), int(check.get('month')), 1)
+                next_month = int(check.get('month')) + 1 if int(check.get('month')) < 12 else 1
+                next_year = int(check.get('year')) if int(check.get('month')) < 12 else int(check.get('year')) + 1
+                _, next_month_last_day = calendar.monthrange(next_year, next_month)
+                max_shift_date_with_next = date(next_year, next_month, next_month_last_day)
+
+                overview_tab, night_tab, small_tab, holiday_tab, note_tab = st.tabs([
+                    "總覽",
+                    "大夜自填",
+                    "小夜自填",
+                    "假日班",
+                    "補班說明",
+                ])
+
+                with overview_tab:
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("護理人員", len(nurses))
+                    with col2:
+                        st.metric("大夜接續", _overview_start_value('night', check.get('next_night')))
+                    with col3:
+                        st.metric("小夜週接續", _overview_start_value('small_night', check.get('next_small_night')))
+                    with col4:
+                        st.metric("假日班接續", _overview_start_value('holiday', check.get('next_holiday')))
+
+                    manual_shift_entries = st.session_state[manual_shift_key]
+                    manual_shift_warnings = _manual_shift_warnings(manual_shift_entries, nurses)
+                    pending_makeup_rows = _pending_makeup_rows(nurses)
+                    excel_prefill_count = (
+                        len(_excel_prefill_rows(nurses, '大夜', min_shift_date, max_shift_date_with_next)) +
+                        len(_excel_prefill_rows(nurses, '小夜週', min_shift_date, max_shift_date_with_next))
+                    )
+                    if manual_shift_warnings:
+                        st.warning("自填班請確認：" + " ".join(manual_shift_warnings))
+                    if excel_prefill_count:
+                        with st.expander("Excel 已寫入的大夜 / 小夜自填", expanded=False):
+                            excel_rows = (
+                                _excel_prefill_rows(nurses, '大夜', min_shift_date, max_shift_date_with_next) +
+                                _excel_prefill_rows(nurses, '小夜週', min_shift_date, max_shift_date_with_next)
+                            )
+                            st.table(excel_rows)
+                    if pending_makeup_rows:
+                        with st.expander("已讀到的大夜 / 小夜待補", expanded=False):
+                            st.table(pending_makeup_rows)
+                    if missing_previous:
+                        st.warning("下列人員沒有讀到既有班別欄位資料：" + "、".join(missing_previous))
+                    elif nurses:
+                        st.success("已讀到所有人員的既有班別欄位資料。")
+
+                    st.markdown("**上月定位點**")
+                    st.markdown(
+                        f"- 大夜: `{check.get('last_night') or '未找到'}`\n"
+                        f"- 小夜週: `{check.get('last_small_night') or '未找到'}`\n"
+                        f"- 假日班: `{check.get('last_holiday') or '未找到'}`"
                     )
 
-                if carryover_by_nurse:
-                    rows = [
-                        {"姓名": name, "跨月補班/備註": "；".join(items)}
-                        for name, items in carryover_by_nurse.items()
+                    st.markdown("**常規排班起頭人員（選填）**")
+                    st.caption("補班會先排入空格；剩下的常規班會從這裡選到的人開始。未選則使用 Excel 自動判斷。")
+                    anchor_options = ['自動判斷'] + nurse_names
+                    anchor_cols = st.columns(3)
+                    anchor_settings = [
+                        ('大夜', 'night', check.get('last_night')),
+                        ('小夜週', 'small_night', check.get('last_small_night')),
+                        ('假日班', 'holiday', check.get('last_holiday')),
                     ]
-                    st.markdown("**跨月補班資料**")
-                    st.table(rows)
+                    for col, (label, shift_type, auto_value) in zip(anchor_cols, anchor_settings):
+                        key = _manual_anchor_key(sheet_name, shift_type)
+                        if st.session_state.get(key) not in anchor_options:
+                            st.session_state[key] = '自動判斷'
+                        with col:
+                            st.selectbox(
+                                label,
+                                options=anchor_options,
+                                key=key,
+                                help=f"目前自動判斷：{auto_value or '未找到'}",
+                            )
 
-                if carryover_by_nurse:
-                    pending_records = [
-                        (name, record)
-                        for name, records in check.get('carryover_records_by_nurse', {}).items()
-                        for record in records
-                        if record.get('type') == 'pending'
-                    ]
-                    if pending_records:
-                        st.markdown("**X月補指定日期（選填）**")
-                        st.caption("不勾指定時，維持原本自動找第一個可補格子的規則。")
-                        _, last_day = calendar.monthrange(int(check.get('year')), int(check.get('month')))
-                        min_makeup_date = date(int(check.get('year')), int(check.get('month')), 1)
-                        max_makeup_date = date(int(check.get('year')), int(check.get('month')), last_day)
-                        for nurse_name, record in pending_records:
-                            default_dt = record.get('target_date')
-                            default_date = default_dt.date() if hasattr(default_dt, 'date') else min_makeup_date
-                            default_shift = record.get('target_shift_type') or '自動'
-                            date_key = _holiday_makeup_ui_key(sheet_name, nurse_name, record, 'date')
-                            shift_key = _holiday_makeup_ui_key(sheet_name, nurse_name, record, 'shift')
-                            if st.session_state.get(date_key) is None:
-                                st.session_state[date_key] = default_date
-                            if st.session_state.get(shift_key) is None:
-                                st.session_state[shift_key] = default_shift
+                    manual_anchor_messages = []
+                    for label, shift_type, _ in anchor_settings:
+                        value = st.session_state.get(_manual_anchor_key(sheet_name, shift_type))
+                        if value and value != '自動判斷':
+                            manual_anchor_messages.append(f"{label}: `{value}`")
+                    if manual_anchor_messages:
+                        st.info("常規起頭已選：" + "、".join(manual_anchor_messages))
 
-                            col_name, col_enabled, col_date, col_shift = st.columns([2, 1, 1, 1])
-                            with col_name:
-                                st.write(f"{nurse_name}: {record.get('original_text', '')}")
-                            with col_enabled:
-                                st.checkbox(
-                                    "指定",
-                                    key=_holiday_makeup_ui_key(sheet_name, nurse_name, record, 'enabled'),
-                                )
-                            with col_date:
-                                st.date_input(
-                                    "日期",
-                                    min_value=min_makeup_date,
-                                    max_value=max_makeup_date,
-                                    key=date_key,
-                                )
-                            with col_shift:
-                                st.selectbox(
-                                    "班別",
-                                    options=['自動', '白班', '小夜', '大夜'],
-                                    key=shift_key,
-                                )
+                with night_tab:
+                    render_manual_shift_tab(
+                        sheet_name,
+                        nurses,
+                        nurse_names,
+                        manual_shift_key,
+                        '大夜',
+                        min_shift_date,
+                        max_shift_date_with_next,
+                    )
 
-                st.markdown("**手動新增補班欄紀錄**")
-                st.caption("若要在輸出 Excel 的補班欄額外註記先前未排的班，請指定人員、日期和班別（白班 / 大夜 / 小夜）。此紀錄只顯示在補班欄，不影響假日班排班順序。")
-                manual_past_makeup_key = _manual_past_makeup_key(sheet_name)
-                if manual_past_makeup_key not in st.session_state:
-                    st.session_state[manual_past_makeup_key] = []
+                with small_tab:
+                    render_manual_shift_tab(
+                        sheet_name,
+                        nurses,
+                        nurse_names,
+                        manual_shift_key,
+                        '小夜週',
+                        min_shift_date,
+                        max_shift_date_with_next,
+                    )
 
-                edit_index_key = f"edit_past_makeup_index_{sheet_name}"
-                if edit_index_key not in st.session_state:
-                    st.session_state[edit_index_key] = None
-                loaded_edit_index_key = f"loaded_edit_past_makeup_index_{sheet_name}"
-                current_edit_index = st.session_state.get(edit_index_key)
-                if current_edit_index is not None and st.session_state.get(loaded_edit_index_key) != current_edit_index:
-                    entries = st.session_state.get(manual_past_makeup_key, [])
-                    if 0 <= current_edit_index < len(entries):
-                        item = entries[current_edit_index]
-                        st.session_state[f"past_makeup_nurse_{sheet_name}"] = item['nurse_name']
-                        st.session_state[f"past_makeup_date_{sheet_name}"] = item['date']
-                        st.session_state[f"past_makeup_shift_{sheet_name}"] = item['shift_type']
-                        st.session_state[f"past_makeup_note_{sheet_name}"] = item['note']
-                        st.session_state[loaded_edit_index_key] = current_edit_index
-
-                with st.expander("新增 / 編輯 補班欄紀錄", expanded=True):
-                    st.caption("此處新增的內容會寫入補班欄，作為人工註記，不會自動排進假日欄。")
-                    add_col1, add_col2, add_col3, add_col4 = st.columns([2, 1, 1, 2])
-                    with add_col1:
-                        selected_past_makeup_nurse = st.selectbox(
-                            "選擇人員",
-                            options=["請選擇"] + nurse_names,
-                            key=f"past_makeup_nurse_{sheet_name}",
-                        )
-                    with add_col2:
-                        selected_past_makeup_date = st.date_input(
-                            "日期",
-                            min_value=date(int(check.get('year')), int(check.get('month')), 1),
-                            max_value=date(int(check.get('year')), int(check.get('month')), calendar.monthrange(int(check.get('year')), int(check.get('month')))[1]),
-                            key=f"past_makeup_date_{sheet_name}",
-                        )
-                    with add_col3:
-                        selected_past_makeup_shift = st.selectbox(
-                            "班別",
-                            options=['白班', '大夜', '小夜'],
-                            key=f"past_makeup_shift_{sheet_name}",
-                        )
-                    with add_col4:
-                        selected_past_makeup_note = st.text_input(
-                            "說明（選填）",
-                            key=f"past_makeup_note_{sheet_name}",
-                            placeholder="例如：先前未補夜班",
-                        )
-
-                    action_col1, action_col2, action_col3 = st.columns([1, 1, 1])
-                    with action_col1:
-                        if st.button("加入/更新欠班", key=f"save_past_makeup_{sheet_name}", use_container_width=True):
-                            if selected_past_makeup_nurse == "請選擇":
-                                st.warning("請先選擇人員再新增欠班。")
-                            else:
-                                to_save = {
-                                    'nurse_name': selected_past_makeup_nurse,
-                                    'date': selected_past_makeup_date,
-                                    'shift_type': selected_past_makeup_shift,
-                                    'note': selected_past_makeup_note.strip() or '手動新增欠班',
-                                }
-                                if st.session_state[edit_index_key] is None:
-                                    st.session_state[manual_past_makeup_key].append(to_save)
-                                    st.success(f"已新增欠班：{selected_past_makeup_nurse} / {selected_past_makeup_date.strftime('%m/%d')} / {selected_past_makeup_shift}")
+                with holiday_tab:
+                    st.markdown("**手動新增補班欄紀錄**")
+                    st.caption("指定日期/班別會占用該格，避免系統重複排給別人；輸出仍只顯示在補班欄。")
+                    manual_past_makeup_key = _manual_past_makeup_key(sheet_name)
+                    if manual_past_makeup_key not in st.session_state:
+                        st.session_state[manual_past_makeup_key] = []
+    
+                    edit_index_key = f"edit_past_makeup_index_{sheet_name}"
+                    if edit_index_key not in st.session_state:
+                        st.session_state[edit_index_key] = None
+                    loaded_edit_index_key = f"loaded_edit_past_makeup_index_{sheet_name}"
+                    current_edit_index = st.session_state.get(edit_index_key)
+                    if current_edit_index is not None and st.session_state.get(loaded_edit_index_key) != current_edit_index:
+                        entries = st.session_state.get(manual_past_makeup_key, [])
+                        if 0 <= current_edit_index < len(entries):
+                            item = entries[current_edit_index]
+                            st.session_state[f"past_makeup_nurse_{sheet_name}"] = item['nurse_name']
+                            st.session_state[f"past_makeup_date_{sheet_name}"] = item['date']
+                            st.session_state[f"past_makeup_shift_{sheet_name}"] = item['shift_type']
+                            st.session_state[f"past_makeup_note_{sheet_name}"] = item['note']
+                            st.session_state[loaded_edit_index_key] = current_edit_index
+    
+                    with st.expander("新增 / 編輯 補班欄紀錄", expanded=True):
+                        st.caption("大夜/小夜會扣掉對應日期；白班或週末大小夜會扣掉同日同班別的假日格子。")
+                        add_col1, add_col2, add_col3, add_col4 = st.columns([2, 1, 1, 2])
+                        with add_col1:
+                            selected_past_makeup_nurse = st.selectbox(
+                                "選擇人員",
+                                options=["請選擇"] + nurse_names,
+                                key=f"past_makeup_nurse_{sheet_name}",
+                            )
+                        with add_col2:
+                            selected_past_makeup_date = st.date_input(
+                                "日期",
+                                min_value=date(int(check.get('year')), int(check.get('month')), 1),
+                                max_value=date(int(check.get('year')), int(check.get('month')), calendar.monthrange(int(check.get('year')), int(check.get('month')))[1]),
+                                key=f"past_makeup_date_{sheet_name}",
+                            )
+                        with add_col3:
+                            selected_past_makeup_shift = st.selectbox(
+                                "班別",
+                                options=['白班', '大夜', '小夜'],
+                                key=f"past_makeup_shift_{sheet_name}",
+                            )
+                        with add_col4:
+                            selected_past_makeup_note = st.text_input(
+                                "說明（選填）",
+                                key=f"past_makeup_note_{sheet_name}",
+                                placeholder="例如：先前未補夜班",
+                            )
+    
+                        action_col1, action_col2, action_col3 = st.columns([1, 1, 1])
+                        with action_col1:
+                            if st.button("加入/更新欠班", key=f"save_past_makeup_{sheet_name}", use_container_width=True):
+                                if selected_past_makeup_nurse == "請選擇":
+                                    st.warning("請先選擇人員再新增欠班。")
                                 else:
-                                    st.session_state[manual_past_makeup_key][st.session_state[edit_index_key]] = to_save
-                                    st.success("已更新欠班紀錄。")
-                                    st.session_state[edit_index_key] = None
-                                    st.session_state[loaded_edit_index_key] = None
-
-                    with action_col2:
-                        if st.button("取消編輯", key=f"cancel_edit_past_makeup_{sheet_name}", use_container_width=True):
-                            st.session_state[edit_index_key] = None
-                            st.session_state[loaded_edit_index_key] = None
-
-                    with action_col3:
-                        if st.button("清除本頁面欠班紀錄", key=f"clear_past_makeup_{sheet_name}", use_container_width=True):
-                            st.session_state[manual_past_makeup_key] = []
-                            st.session_state[edit_index_key] = None
-                            st.session_state[loaded_edit_index_key] = None
-                            st.rerun()
-
-                    st.markdown("**目前手動欠班清單**")
-                    entries = st.session_state[manual_past_makeup_key]
-                    if entries:
-                        for idx, item in enumerate(entries):
-                            row_col1, row_col2, row_col3, row_col4, row_col5 = st.columns([2, 1, 1, 3, 1])
-                            with row_col1:
-                                st.write(item['nurse_name'])
-                            with row_col2:
-                                st.write(item['date'].strftime('%Y/%m/%d'))
-                            with row_col3:
-                                st.write(item['shift_type'])
-                            with row_col4:
-                                st.write(item['note'])
-                            with row_col5:
-                                if st.button("編輯", key=f"edit_past_makeup_{sheet_name}_{idx}", use_container_width=True):
-                                    st.session_state[edit_index_key] = idx
-                                    st.session_state[loaded_edit_index_key] = None
-                                    st.rerun()
-                                if st.button("刪除", key=f"delete_past_makeup_{sheet_name}_{idx}", use_container_width=True):
-                                    entries.pop(idx)
-                                    st.success("已刪除欠班紀錄。")
-                                    st.rerun()
-                    else:
-                        st.info("目前尚未新增任何手動過去欠班紀錄。")
-
-                st.markdown("**補班說明（選填）**")
-                st.caption("若 Excel 補班欄未能完整描述補班需求，可在此填寫本次排班的補班備註。")
-                makeup_text_key = _makeup_note_key(sheet_name)
-                if makeup_text_key not in st.session_state:
-                    st.session_state[makeup_text_key] = ''
-                st.text_area(
-                    "補班說明",
-                    key=makeup_text_key,
-                    height=100,
-                    placeholder="例如：請優先補班 5/10-5/12 小夜；或：本週補班以補大夜為主。",
-                )
-
-                missing_previous = [nurse.name for nurse in nurses if nurse.name not in previous_entries]
-                if missing_previous:
-                    st.warning("下列人員沒有讀到既有班別欄位資料：" + "、".join(missing_previous))
-                elif nurses:
-                    st.success("已讀到所有人員的既有班別欄位資料。")
-
+                                    to_save = {
+                                        'nurse_name': selected_past_makeup_nurse,
+                                        'date': selected_past_makeup_date,
+                                        'shift_type': selected_past_makeup_shift,
+                                        'note': selected_past_makeup_note.strip() or '手動新增欠班',
+                                    }
+                                    if st.session_state[edit_index_key] is None:
+                                        st.session_state[manual_past_makeup_key].append(to_save)
+                                        st.success(f"已新增欠班：{selected_past_makeup_nurse} / {selected_past_makeup_date.strftime('%m/%d')} / {selected_past_makeup_shift}")
+                                    else:
+                                        st.session_state[manual_past_makeup_key][st.session_state[edit_index_key]] = to_save
+                                        st.success("已更新欠班紀錄。")
+                                        st.session_state[edit_index_key] = None
+                                        st.session_state[loaded_edit_index_key] = None
+    
+                        with action_col2:
+                            if st.button("取消編輯", key=f"cancel_edit_past_makeup_{sheet_name}", use_container_width=True):
+                                st.session_state[edit_index_key] = None
+                                st.session_state[loaded_edit_index_key] = None
+    
+                        with action_col3:
+                            if st.button("清除本頁面欠班紀錄", key=f"clear_past_makeup_{sheet_name}", use_container_width=True):
+                                st.session_state[manual_past_makeup_key] = []
+                                st.session_state[edit_index_key] = None
+                                st.session_state[loaded_edit_index_key] = None
+                                st.rerun()
+    
+                        st.markdown("**目前手動欠班清單**")
+                        entries = st.session_state[manual_past_makeup_key]
+                        if entries:
+                            for idx, item in enumerate(entries):
+                                row_col1, row_col2, row_col3, row_col4, row_col5 = st.columns([2, 1, 1, 3, 1])
+                                with row_col1:
+                                    st.write(item['nurse_name'])
+                                with row_col2:
+                                    st.write(item['date'].strftime('%Y/%m/%d'))
+                                with row_col3:
+                                    st.write(item['shift_type'])
+                                with row_col4:
+                                    st.write(item['note'])
+                                with row_col5:
+                                    if st.button("編輯", key=f"edit_past_makeup_{sheet_name}_{idx}", use_container_width=True):
+                                        st.session_state[edit_index_key] = idx
+                                        st.session_state[loaded_edit_index_key] = None
+                                        st.rerun()
+                                    if st.button("刪除", key=f"delete_past_makeup_{sheet_name}_{idx}", use_container_width=True):
+                                        entries.pop(idx)
+                                        st.success("已刪除欠班紀錄。")
+                                        st.rerun()
+                        else:
+                            st.info("目前尚未新增任何手動過去欠班紀錄。")
+    
+                with note_tab:
+                    st.markdown("**補班說明（選填）**")
+                    st.caption("若 Excel 補班欄未能完整描述補班需求，可在此填寫本次排班的補班備註。")
+                    makeup_text_key = _makeup_note_key(sheet_name)
+                    if makeup_text_key not in st.session_state:
+                        st.session_state[makeup_text_key] = ''
+                    st.text_area(
+                        "補班說明",
+                        key=makeup_text_key,
+                        height=100,
+                        placeholder="例如：請優先補班 5/10-5/12 小夜；或：本週補班以補大夜為主。",
+                    )
+    
     def render_shift_preview(results, month):
         tab_night, tab_small, tab_holiday = st.tabs(["大夜", "小夜週", "假日班"])
 
@@ -602,6 +921,16 @@ if modules_loaded:
         st.markdown("---")
         st.success("✅ 排班完成！")
 
+        st.header("📥 下載結果")
+        st.download_button(
+            label=f"下載結果 {run['output_filename']}",
+            data=run['output_bytes'],
+            file_name=run['output_filename'],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True
+        )
+
         show_logs = st.checkbox("顯示詳細 log", value=False, key="show_logs")
         log_container = st.expander("📝 排班詳細日誌", expanded=show_logs)
         with log_container:
@@ -634,17 +963,6 @@ if modules_loaded:
 
                 st.markdown("**結果預覽：**")
                 render_shift_preview(results, run.get('month'))
-
-        st.markdown("---")
-        st.header("📥 下載結果")
-        st.download_button(
-            label=f"下載結果 {run['output_filename']}",
-            data=run['output_bytes'],
-            file_name=run['output_filename'],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            use_container_width=True
-        )
     # ========== 側邊欄：國定假日設定 ==========
     with st.sidebar:
         st.header("📅 國定假日設定")
@@ -797,6 +1115,13 @@ if modules_loaded:
 
     # 檔案上傳區
     st.header("📁 上傳值班表")
+    st.markdown("**上傳前請先確認**")
+    st.info(
+        "1. 需要補班的人，請在 Excel 的「補班」欄填「補」或「待補班」即可；不確定日期時不用先寫日期，系統會先找可補的空格。\n\n"
+        "2. 上傳後請看「排班前檢查」，確認大夜、小夜週、假日班的常規起頭人員是否正確；需要時可手動指定起頭。\n\n"
+        "3. 新增人員可直接接在 Excel 名單最下面一列；刪除人員請刪除整列，避免留下空白資料。\n\n"
+        "4. 請先檢查下個月假日班、大P、小P、換心、待命等資訊是否已填好，系統會依這些欄位判斷是否跳過或改補。"
+    )
     uploaded_file = st.file_uploader(
         "選擇 Excel 檔案",
         type=['xlsx', 'xls'],
@@ -828,6 +1153,26 @@ if modules_loaded:
 
                 year = roc_to_western_year(roc_year)
 
+                # 檢查對應年份的國定假日設定
+                year_str = str(year)
+                holidays_for_year = st.session_state.all_holidays.get(year_str)
+                month_holidays = {}
+                holiday_metric_text = '未設定'
+                if holidays_for_year is not None:
+                    month_holidays = {
+                        k: v for k, v in holidays_for_year.items()
+                        if int(k.split('/')[0]) == month
+                    }
+                    if month_holidays:
+                        holiday_metric_text = '、'.join([
+                            f"{k}({v})" for k, v in sorted(
+                                month_holidays.items(),
+                                key=lambda x: int(x[0].split('/')[1])
+                            )
+                        ])
+                    else:
+                        holiday_metric_text = '無'
+
                 # 顯示檔案資訊
                 col1, col2, col3 = st.columns(3)
                 with col1:
@@ -835,31 +1180,13 @@ if modules_loaded:
                 with col2:
                     st.metric("📆 月份", f"{month} 月")
                 with col3:
-                    st.metric("🗓️ 西元年", f"{year} 年")
+                    st.metric("🎌 國定假日", holiday_metric_text)
 
                 # 取得頁籤
                 sheet_names = get_sheet_names(tmp_path)
                 st.info(f"📑 找到 {len(sheet_names)} 個頁籤: {', '.join(sheet_names)}")
 
-                st.markdown("**補班提示**")
-                st.info(
-                    "請確認 Excel 中是否已填寫「補班」或「待補班」欄位，例如："
-                    "`待補班:2/26-2/28大夜`、`6月補@6/14白班`。"
-                )
-
-                # 檢查對應年份的國定假日設定
-                year_str = str(year)
-                if year_str in st.session_state.all_holidays:
-                    holidays_for_year = st.session_state.all_holidays[year_str]
-                    month_holidays = {k: v for k, v in holidays_for_year.items()
-                                      if int(k.split('/')[0]) == month}
-                    if month_holidays:
-                        holiday_str = ", ".join([f"{k}({v})" for k, v in sorted(month_holidays.items(),
-                                                 key=lambda x: int(x[0].split('/')[1]))])
-                        st.success(f"🎌 {month}月國定假日: {holiday_str}")
-                    else:
-                        st.info(f"📅 {month}月沒有國定假日")
-                else:
+                if holidays_for_year is None:
                     st.warning(f"⚠️ 尚未設定 {year} 年的國定假日，請在左側新增")
 
                 st.markdown("---")
@@ -919,6 +1246,7 @@ if modules_loaded:
                             manual_anchor_overrides = get_manual_anchor_overrides(sheet_name)
                             holiday_makeup_date_overrides = get_holiday_makeup_date_overrides(sheet_name, pre_schedule_check)
                             manual_past_makeup_entries = get_manual_past_makeup_entries(sheet_name)
+                            manual_shift_entries = get_manual_shift_entries(sheet_name)
                             manual_makeup_note = st.session_state.get(_makeup_note_key(sheet_name), '').strip()
                             pre_schedule_check['manual_makeup_note'] = manual_makeup_note
 
@@ -941,11 +1269,12 @@ if modules_loaded:
                                         sheet_name,
                                         year,
                                         month,
-                                        last_assigned_night_name=manual_anchor_overrides.get('night'),
-                                        last_assigned_small_night_name=manual_anchor_overrides.get('small_night'),
-                                        last_assigned_holiday_name=manual_anchor_overrides.get('holiday'),
+                                        regular_start_night_name=manual_anchor_overrides.get('night'),
+                                        regular_start_small_night_name=manual_anchor_overrides.get('small_night'),
+                                        regular_start_holiday_name=manual_anchor_overrides.get('holiday'),
                                         holiday_makeup_date_overrides=holiday_makeup_date_overrides,
                                         manual_makeup_entries=manual_past_makeup_entries,
+                                        manual_shift_entries=manual_shift_entries,
                                         manual_makeup_note=manual_makeup_note,
                                     )
 
@@ -963,6 +1292,7 @@ if modules_loaded:
                                         'manual_anchor_overrides': manual_anchor_overrides,
                                         'holiday_makeup_date_overrides': holiday_makeup_date_overrides,
                                         'manual_makeup_entries': manual_past_makeup_entries,
+                                        'manual_shift_entries': manual_shift_entries,
                                         'manual_makeup_note': manual_makeup_note,
                                     }
                                 except Exception as e:
@@ -1024,6 +1354,3 @@ if modules_loaded:
         if st.session_state.get('last_run'):
             render_last_run()
 
-    else:
-        # 沒有上傳檔案時顯示提示
-        st.info("請上傳 Excel 值班表以開始排班")

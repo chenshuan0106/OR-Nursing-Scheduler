@@ -1,11 +1,11 @@
 """
-小夜班排班核心邏輯
+小夜週排班邏輯。
 """
-from typing import List, Dict, Tuple
+from datetime import datetime, timedelta
+from typing import Dict, List, Set, Tuple
 
 from models import NurseInfo
 from shift_utils import (
-    should_skip_for_special_status,
     should_skip_for_p_shift,
     should_skip_for_leave,
     should_skip_for_consecutive_days,
@@ -17,34 +17,29 @@ from date_utils import (
 )
 
 
+SMALL_NIGHT_SHIFT_TYPES = {'小夜', '小夜週'}
+
+
+def _is_small_night_shift_type(shift_type: str) -> bool:
+    return shift_type in SMALL_NIGHT_SHIFT_TYPES
+
+
 def get_small_night_shift_groups_for_month(year: int, month: int) -> List[Tuple[List, str]]:
     """
-    取得指定月份的小夜班組別
-    小夜班是星期一～五為一組 (一個 cost)
+    取得指定月份的小夜週班組。
 
-    返回: [(日期列表, 組別類型), ...]
-    組別類型: 'mon-fri'
-
-    注意：
-    - 月底可能會跨月，例如 3/31(一)、4/1(二)、4/2(三)、4/3(四)、4/4(五)
-    - 月初不完整的組別會被跳過（例如4/1-4/3不會成為組別）
+    小夜週以完整週一到週五為一組。若月底週未滿五個平日，會往下個月補到
+    週五；月初若不是週一，則從第一個完整週一開始。
     """
-    from datetime import timedelta
-
     groups = []
     dates = get_month_dates(year, month)
 
-    # 計算下個月
-    next_month = month + 1 if month < 12 else 1
-    next_year = year if month < 12 else year + 1
-
     current_group = []
 
-    # 找到第一個完整組別的開始（週一）
+    # 找到第一個完整週的週一。
     first_complete_idx = 0
     if dates:
         first_weekday = dates[0].weekday()
-        # 如果第一天不是週一(0)，跳過直到找到週一
         if first_weekday != 0:
             for idx, date in enumerate(dates):
                 if date.weekday() == 0:  # 週一
@@ -54,23 +49,21 @@ def get_small_night_shift_groups_for_month(year: int, month: int) -> List[Tuple[
     for date in dates[first_complete_idx:]:
         weekday = date.weekday()
 
-        # 星期一～五
+        # 週一到週五為一組。
         if weekday in [0, 1, 2, 3, 4]:
             current_group.append(date)
-            if weekday == 4:  # 週五，結束這一組
+            if weekday == 4:  # 週五，結束本組。
                 groups.append((current_group, 'mon-fri'))
                 current_group = []
 
-    # 處理月底未結束的組（可能需要跨月補齊）
+    # 月底未滿週五時，往下個月補足到週五。
     if current_group:
         last_date = current_group[-1]
         last_weekday = last_date.weekday()
 
-        # 需要補到週五
         days_to_add = 4 - last_weekday  # 補到週五(4)
         for i in range(1, days_to_add + 1):
             next_date = last_date + timedelta(days=i)
-            # 跳過週六日
             while next_date.weekday() in [5, 6]:
                 next_date += timedelta(days=1)
             if next_date.weekday() <= 4:
@@ -90,32 +83,40 @@ def should_skip_small_night_shift(
     next_month: int = None,
 ) -> Tuple[bool, str]:
     """
-    判斷護理人員是否應該跳過這次小夜班
+    判斷護理師是否需要跳過本次小夜週排班。
 
-    返回: (是否跳過, 原因)
+    Returns:
+        (是否跳過, 原因)
     """
-
-    # 1. 檢查特殊狀態（小夜班只檢查哺乳，不檢查55歲）
+    # 1. 哺乳同仁不排小夜週。
     if nurse.is_breastfeeding:
         return True, '哺乳'
 
-    # 2. 檢查 P1/P2/換心/待命
+    # 2. 檢查 P1/P2/換心/待命。
     skip, reason = should_skip_for_p_shift(nurse, target_month, target_dates)
     if skip:
         return True, reason
 
-    # 3. 檢查公休（小夜班不需要檢查前一天）
+    # 3. 檢查公休/婚假；小夜週不需要檢查前一天。
     skip, reason = should_skip_for_leave(nurse, target_dates, check_day_before=False)
     if skip:
         return True, reason
 
-    # 5. 檢查是否與大夜重疊（同一天）
+    # 4. 小夜週不能和已排的大夜重疊。
     if nurse.night_shift_dates:
         night_dates = {d.date() for d in nurse.night_shift_dates}
         if any(d.date() in night_dates for d in target_dates):
             return True, '大夜重疊'
 
-    # 6. 檢查連續7天上班
+    manual_makeup_days = {
+        block.get('date').date()
+        for block in getattr(nurse, 'manual_makeup_shift_blocks', [])
+        if block.get('date') and not _is_small_night_shift_type(block.get('shift_type'))
+    }
+    if any(d.date() in manual_makeup_days for d in target_dates):
+        return True, '補班欄重疊'
+
+    # 5. 檢查是否超過連續工作天數限制。
     skip, reason = should_skip_for_consecutive_days(
         nurse, target_dates, target_month, target_year, prev_month, next_month
     )
@@ -125,145 +126,309 @@ def should_skip_small_night_shift(
     return False, ''
 
 
+def _apply_manual_small_night_shift_prefills(
+    nurses: List[NurseInfo],
+    small_night_groups: List[Tuple[List, str]],
+    next_month: int,
+) -> Tuple[List[Dict], List[Tuple[List, str]]]:
+    """Create fixed results from dates already filled in the 小夜週 column."""
+    manual_results = []
+    remaining_groups = []
+
+    for group_dates, group_type in small_night_groups:
+        taken_days = set()
+        is_next_month_group = all(d.month == next_month for d in group_dates)
+
+        for nurse in nurses:
+            manual_days = {
+                d.date()
+                for d in getattr(nurse, 'manual_small_night_shift_dates', [])
+                if any(d.date() == group_date.date() for group_date in group_dates)
+            }
+            selected_dates = [
+                d for d in group_dates
+                if d.date() in manual_days and d.date() not in taken_days
+            ]
+            if not selected_dates:
+                continue
+
+            taken_days.update(d.date() for d in selected_dates)
+            holiday_dates = [d for d in selected_dates if is_holiday(d)]
+            manual_results.append({
+                'nurse': nurse,
+                'dates': selected_dates,
+                'group_type': group_type,
+                'has_holiday': len(holiday_dates) > 0,
+                'holiday_dates': holiday_dates,
+                'is_makeup': False,
+                'is_next_month': is_next_month_group,
+                'is_manual': True,
+            })
+            nurse.small_night_shift_dates.extend(selected_dates)
+            print(f"  手動自填小夜週: {nurse.name} {format_dates_to_dot_string(selected_dates)}")
+
+        remaining_dates = [d for d in group_dates if d.date() not in taken_days]
+        if remaining_dates:
+            remaining_groups.append((remaining_dates, group_type))
+
+    return manual_results, remaining_groups
+
+
+def _remove_manual_makeup_small_night_blocks(
+    nurses: List[NurseInfo],
+    small_night_groups: List[Tuple[List, str]],
+) -> List[Tuple[List, str]]:
+    blocked_days = {
+        block.get('date').date()
+        for nurse in nurses
+        for block in getattr(nurse, 'manual_makeup_shift_blocks', [])
+        if _is_small_night_shift_type(block.get('shift_type')) and block.get('date')
+    }
+    if not blocked_days:
+        return small_night_groups
+
+    remaining_groups = []
+    for group_dates, group_type in small_night_groups:
+        remaining_dates = [d for d in group_dates if d.date() not in blocked_days]
+        blocked_in_group = [d for d in group_dates if d.date() in blocked_days]
+        for d in blocked_in_group:
+            print(f"  補班欄手動指定小夜，略過自動排班日期: {d.month}/{d.day}")
+        if remaining_dates:
+            remaining_groups.append((remaining_dates, group_type))
+    return remaining_groups
+
+
+def _has_current_month_small_night_assignment(
+    nurse: NurseInfo,
+    results: List[Dict],
+    target_year: int,
+    target_month: int,
+) -> bool:
+    for result in results:
+        if result.get('nurse') is not nurse:
+            continue
+        if any(d.year == target_year and d.month == target_month for d in result.get('dates', [])):
+            return True
+    return False
+
+
+def _should_defer_regular_skip(reason: str) -> bool:
+    """Return True when a regular-rotation skip should be retried later."""
+    if not reason:
+        return True
+    if reason == '哺乳':
+        return False
+    if ('P1' in reason or 'P2' in reason or '換心' in reason) and '衝班' not in reason:
+        return False
+    return True
+
+
 def schedule_small_night_shifts(
     nurses: List[NurseInfo],
     target_year: int,
     target_month: int,
     last_assigned_index: int = -1,
     include_next_month_first: bool = True,
-) -> Tuple[List[Dict], str]:
+    regular_start_index: int = None,
+) -> Tuple[List[Dict], str, Set[str]]:
     """
-    排小夜班
+    安排小夜週。
 
     Args:
-        nurses: 護理人員列表（按照名單順序）
-        target_year: 目標年份
-        target_month: 目標月份
-        last_assigned_index: 上個月最後輪到的人的索引
-        include_next_month_first: 是否包含下個月第一個 cost
+        nurses: 護理師資料清單，依輪序排列。
+        target_year: 目標年份。
+        target_month: 目標月份。
+        last_assigned_index: 上一次正常輪序排到的護理師索引。
+        include_next_month_first: 是否納入下個月第一組跨月小夜週。
+        regular_start_index: 指定正常輪序起始索引；未指定時接續 last_assigned_index。
 
     Returns:
-        (排班結果列表, 正常輪序最後一個人的名字)
+        (排班結果清單, 本月最後正常輪序者姓名, 因身分或特殊條件跳過者集合)
 
-        注意：正常輪序最後一個人 ≠ 最後排班的人
-        補班的人不算在正常輪序中，下個月應該從正常輪序最後一個人繼續往上排
-
-    注意：小夜班是「往上排」，從上個月最後輪到的人的上一位開始
+    小夜週輪序方向與大夜相反，因此預設從 last_assigned_index - 1 開始。
     """
-    # 在清空本月資料前，先記錄上月跨月排班中包含本月「平日」國定假日的日期
-    # 只有週一到週五的國定假日才能補償（跳過一次假日值班，不用補班）
+    # 清掉本月預排的小夜週日期，避免重新排班時累積舊資料。
     for nurse in nurses:
         nurse.small_night_shift_dates = [
-            d for d in nurse.small_night_shift_dates 
+            d for d in nurse.small_night_shift_dates
             if d.month != target_month or d.year != target_year
         ]
-    
-    # 取得本月的小夜班組別
+
+    # 取得本月小夜週班組。
     small_night_groups = get_small_night_shift_groups_for_month(target_year, target_month)
 
-    # 注意：不過濾上個月排的本月cost
-    # 原因：上個月排的本月第一個cost只是「預告」
-    # 本月排班時會從第一個cost開始重新排，覆蓋預告
-
-    # 計算下個月
+    # 計算下個月，用於跨月小夜週與下個月第一組小夜週。
     next_month = target_month + 1 if target_month < 12 else 1
     next_year = target_year if target_month < 12 else target_year + 1
 
-    # 如果需要包含下個月第一個 cost
+    # 需要時補入下個月第一組未與本月最後一組重疊的小夜週。
     if include_next_month_first:
         next_month_groups = get_small_night_shift_groups_for_month(next_year, next_month)
 
         if next_month_groups:
-            # 取得本月最後一組的所有日期(使用完整日期物件)
             last_group_dates = small_night_groups[-1][0] if small_night_groups else []
-            last_group_date_set = set(d.date() for d in last_group_dates)
+            last_group_date_set = {d.date() for d in last_group_dates}
 
-            # 找到第一個與本月最後一組沒有日期重疊的組別
             for group_dates, group_type in next_month_groups:
-                group_date_set = set(d.date() for d in group_dates)
-                # 如果沒有重疊的日期,就加入這個組別
+                group_date_set = {d.date() for d in group_dates}
                 if not (group_date_set & last_group_date_set):
                     small_night_groups.append((group_dates, group_type))
                     break
 
-    # 計算前後月
+    scheduled_days = {d.date() for group_dates, _ in small_night_groups for d in group_dates}
+    for nurse in nurses:
+        nurse.small_night_shift_dates = [
+            d for d in nurse.small_night_shift_dates
+            if d.date() not in scheduled_days
+        ]
+
+    manual_results, small_night_groups = _apply_manual_small_night_shift_prefills(
+        nurses, small_night_groups, next_month
+    )
+    small_night_groups = _remove_manual_makeup_small_night_blocks(nurses, small_night_groups)
+
+    # 計算上個月，用於跨月連續天數檢查。
     prev_month = target_month - 1 if target_month > 1 else 12
 
-    results = []
+    results = manual_results
 
-    # 如果沒有護理人員，直接返回空列表
     if not nurses:
-        return results, ''
+        return results, '', set()
 
-    # 小夜班是「往上排」，從上個月最後輪到的人的上一位開始
-    # last_assigned_index 是上個月最後輪到的人
-    # 往上一位就是 last_assigned_index - 1
-    current_index = (last_assigned_index - 1) % len(nurses)
+    current_index = (
+        regular_start_index % len(nurses)
+        if regular_start_index is not None and regular_start_index >= 0
+        else (last_assigned_index - 1) % len(nurses)
+    )
 
-    # 追蹤正常輪序最後一個人（不含補班）
+    # 記錄本月最後一位正常輪序排到的人。
     last_normal_assigned_name = ''
 
-    # 待補班名單 (因公休跳過的人)
-    # 格式: [(nurse_index, original_dates), ...]
+    # 待補班佇列，格式: [(nurse_index, original_dates), ...]
     makeup_queue = []
 
-    # 從備註欄讀取的待補班（上個月遺留的）加入 makeup_queue
+    # 先處理從備註/補班欄讀到的待補班。
     for idx, nurse in enumerate(nurses):
         if nurse.pending_small_night_makeup:
             for makeup_info in nurse.pending_small_night_makeup:
                 makeup_queue.append((idx, makeup_info['dates']))
-                print(f"  從備註讀取待補班: {nurse.name} (原本 {format_dates_to_dot_string(makeup_info['dates'])})")
+                print(
+                    f"  讀取到小夜待補班: {nurse.name} "
+                    f"(原 {format_dates_to_dot_string(makeup_info['dates'])})"
+                )
 
-    # 因身分別被跳過的護理人員（用於 Excel 顯示）
+    # 記錄因身分或特殊條件被跳過的人，供 Excel 備註使用。
     identity_skipped_nurses = set()
-    
-    for group_dates, group_type in small_night_groups:
-        assigned = False
+    current_month_group_count = sum(
+        1
+        for group_dates, _ in small_night_groups
+        if any(d.year == target_year and d.month == target_month for d in group_dates)
+    )
+    limit_one_assignment_per_month = len(nurses) >= current_month_group_count
 
-        # 判斷這組是否為下個月的班
-        is_next_month_group = all(d.month == next_month for d in group_dates)
+    user_makeup_queue = makeup_queue
+    user_makeup_unassigned = []
+    makeup_queue = []
+    occupied_group_indexes = set()
 
-        # 1. 先檢查待補班名單
-        for i, (makeup_index, original_dates) in enumerate(makeup_queue):
-            nurse = nurses[makeup_index]
+    for makeup_index, original_dates in user_makeup_queue:
+        nurse = nurses[makeup_index]
+        assigned_makeup = False
+        for group_idx, (group_dates, group_type) in enumerate(small_night_groups):
+            if group_idx in occupied_group_indexes:
+                continue
 
             should_skip, reason = should_skip_small_night_shift(
                 nurse, group_dates, target_month, target_year, prev_month, next_month
             )
+            if should_skip:
+                print(f"  補班跳過 {nurse.name}: {reason}")
+                continue
 
-            if not should_skip:
-                holiday_dates = [d for d in group_dates if is_holiday(d)]
-                has_holiday = len(holiday_dates) > 0
+            is_next_month_group = all(d.month == next_month for d in group_dates)
+            holiday_dates = [d for d in group_dates if is_holiday(d)]
+            results.append({
+                'nurse': nurse,
+                'dates': group_dates,
+                'group_type': group_type,
+                'has_holiday': len(holiday_dates) > 0,
+                'holiday_dates': holiday_dates,
+                'is_makeup': True,
+                'is_next_month': is_next_month_group,
+                'original_dates': original_dates,
+            })
+            nurse.small_night_shift_dates.extend(group_dates)
+            occupied_group_indexes.add(group_idx)
+            print(f"  補班: {nurse.name} (原 {format_dates_to_dot_string(original_dates)})")
+            assigned_makeup = True
+            break
 
-                results.append({
-                    'nurse': nurse,
-                    'dates': group_dates,
-                    'group_type': group_type,
-                    'has_holiday': has_holiday,
-                    'holiday_dates': holiday_dates,
-                    'is_makeup': True,
-                    'is_next_month': is_next_month_group,
-                    'original_dates': original_dates,  # 補班原始日期
-                })
+        if not assigned_makeup:
+            user_makeup_unassigned.append((makeup_index, original_dates))
 
-                nurse.small_night_shift_dates.extend(group_dates)
-                makeup_queue.pop(i)
-                print(f"  補班: {nurse.name} (原本 {format_dates_to_dot_string(original_dates)} 公休)")
-                assigned = True
-                break
+    small_night_groups = [
+        item for group_idx, item in enumerate(small_night_groups)
+        if group_idx not in occupied_group_indexes
+    ]
+
+    for group_dates, group_type in small_night_groups:
+        assigned = False
+
+        # 判斷這組是否完全屬於下個月。
+        is_next_month_group = all(d.month == next_month for d in group_dates)
+
+        for queued_idx, (makeup_index, original_dates) in enumerate(list(makeup_queue)):
+            nurse = nurses[makeup_index]
+            if (
+                limit_one_assignment_per_month
+                and _has_current_month_small_night_assignment(nurse, results, target_year, target_month)
+            ):
+                continue
+
+            should_skip, reason = should_skip_small_night_shift(
+                nurse, group_dates, target_month, target_year, prev_month, next_month
+            )
+            if should_skip:
+                continue
+
+            holiday_dates = [d for d in group_dates if is_holiday(d)]
+            results.append({
+                'nurse': nurse,
+                'dates': group_dates,
+                'group_type': group_type,
+                'has_holiday': len(holiday_dates) > 0,
+                'holiday_dates': holiday_dates,
+                'is_makeup': True,
+                'is_next_month': is_next_month_group,
+                'original_dates': original_dates,
+            })
+            nurse.small_night_shift_dates.extend(group_dates)
+            makeup_queue.pop(queued_idx)
+            print(f"  輪序回補: {nurse.name} (原 {format_dates_to_dot_string(original_dates)})")
+            assigned = True
+            break
 
         if assigned:
             continue
 
-        # 2. 正常輪值（往上排）
+        # 2. 正常輪序；小夜週由後往前輪。
         attempts = 0
         while attempts < len(nurses):
             nurse = nurses[current_index]
 
+            if (
+                limit_one_assignment_per_month
+                and _has_current_month_small_night_assignment(nurse, results, target_year, target_month)
+            ):
+                print(f"  跳過 {nurse.name}: 本月已有小夜")
+                current_index = (current_index - 1) % len(nurses)
+                attempts += 1
+                continue
+
             should_skip, reason = should_skip_small_night_shift(
                 nurse, group_dates, target_month, target_year, prev_month, next_month
             )
-            
+
             if not should_skip:
                 holiday_dates = [d for d in group_dates if is_holiday(d)]
                 has_holiday = len(holiday_dates) > 0
@@ -279,87 +444,97 @@ def schedule_small_night_shifts(
                 })
 
                 nurse.small_night_shift_dates.extend(group_dates)
-                
-                # 輸出排班記錄
+
                 date_str = format_dates_to_dot_string(group_dates)
                 print(f"  正常輪序: {nurse.name} {date_str}")
 
-                # 記錄正常輪序最後一個人（只記錄本月的，不記錄下月的）
+                # 只用本月班組更新正常輪序定位點。
                 if not is_next_month_group:
                     last_normal_assigned_name = nurse.name
 
-                # 往上排，所以是 -1
                 current_index = (current_index - 1) % len(nurses)
                 assigned = True
                 break
-            else:
-                print(f"  跳過 {nurse.name}: {reason}")
 
-                # 記錄因身分別（哺乳/P/換心）被跳過的護理人員
-                if reason not in ('公休中', '婚假', '大夜重疊'):
-                    identity_skipped_nurses.add(nurse.name)
+            print(f"  跳過 {nurse.name}: {reason}")
 
-                if reason in ['公休中', '大夜重疊']:
-                    makeup_queue.append((current_index, group_dates))
-                    print(f"    → 加入待補班名單")
+            # 身分或特殊條件跳過者需要寫回備註；公休/婚假/大夜重疊不列入。
+            if reason not in ('公休前一日', '婚假', '大夜重疊'):
+                identity_skipped_nurses.add(nurse.name)
 
-                # 往上排，所以是 -1
-                current_index = (current_index - 1) % len(nurses)
-                attempts += 1
+            if _should_defer_regular_skip(reason):
+                makeup_queue.append((current_index, group_dates))
+                print("    加入待補班佇列")
+
+            current_index = (current_index - 1) % len(nurses)
+            attempts += 1
 
         if not assigned:
-            print(f"警告: 無法為 {format_dates_to_dot_string(group_dates)} 找到可排班的人員")
+            print(f"警告: {format_dates_to_dot_string(group_dates)} 找不到可排班護理師")
 
-    # 如果還有人在待補班名單但本月排不完，記錄到 new_pending_makeup
+    makeup_queue = user_makeup_unassigned + makeup_queue
+
+    # 若仍有無法完成的補班，寫回 new_pending_makeup 供下次排班使用。
     if makeup_queue:
-        print(f"\n注意: 以下人員本月尚未補班完成:")
+        print("\n提示: 以下護理師本月無法完成小夜補班:")
         for makeup_index, original_dates in makeup_queue:
             nurse = nurses[makeup_index]
-            print(f"  - {nurse.name} (原本 {format_dates_to_dot_string(original_dates)})")
-            # 記錄到 nurse 的 new_pending_makeup，輸出時會寫入備註
+            print(f"  - {nurse.name} (原 {format_dates_to_dot_string(original_dates)})")
+            # 待補班備註格式使用「小夜」，與 shift_utils/excel_handler 保持一致。
             nurse.new_pending_makeup.append({
                 'dates': original_dates,
                 'shift_type': '小夜',
             })
 
-    # 標記正常輪序最後一個班次（加 # 標註）
+    results.sort(key=lambda result: min(result['dates']) if result.get('dates') else datetime.max)
+
+    # 標記最後一筆本月正常輪序結果，輸出時加上 #。
     last_normal_result = None
     for result in results:
-        if not result.get('is_makeup') and not result.get('is_next_month'):
+        if (
+            not result.get('is_makeup')
+            and not result.get('is_next_month')
+            and not result.get('is_manual')
+        ):
             last_normal_result = result
-    
+
     if last_normal_result:
         last_normal_result['is_last_normal'] = True
 
-    # 記錄本月排班中包含的平日國定假日（供假日班補償使用）
+    # 記錄本月小夜週遇到平日國定假日的補償日期。
     for result in results:
         nurse = result['nurse']
         dates = result['dates']
-        # 只檢查本月的排班（不含下月預告）
+        # 下個月的預排班不消耗本月補償。
         if not result.get('is_next_month'):
             for d in dates:
-                # 檢查：本月 + 國定假日 + 平日（週一到週五）
-                if (d.month == target_month and d.year == target_year 
-                    and is_holiday(d) 
-                    and d.weekday() < 5):  # 0=週一, 4=週五
-                    # 記錄這個平日國定假日日期，供假日班排班使用
+                # 只有本月平日國定假日才登記補償。
+                if (
+                    d.month == target_month
+                    and d.year == target_year
+                    and is_holiday(d)
+                    and d.weekday() < 5
+                ):
+                    # 避免同一天補償重複記錄。
                     if d not in nurse.holiday_compensations_used:
                         nurse.holiday_compensations_used.append(d)
                         weekday_name = ['週一', '週二', '週三', '週四', '週五'][d.weekday()]
-                        print(f"  記錄 {nurse.name} 本月小夜週包含平日國定假日: {d.month}/{d.day}({weekday_name})")
+                        print(
+                            f"  記錄 {nurse.name} 本月小夜週平日國假補償: "
+                            f"{d.month}/{d.day}({weekday_name})"
+                        )
 
-    print(f"  正常輪序定位點: {last_normal_assigned_name}")
+    print(f"  小夜正常輪序定位點: {last_normal_assigned_name}")
     return results, last_normal_assigned_name, identity_skipped_nurses
 
 
 def format_small_night_shift_result(result: Dict) -> str:
     """
-    格式化小夜班結果為 Excel 顯示格式
-    
-    正常班：3/9-3/13
-    正常輪序最後一個：3/30-4/3#
-    補班：3/16-3/20
-          (原3/9-3/13)  ← 括號換行
+    格式化小夜週排班結果，供 Excel 欄位輸出。
+
+    一般格式: 3/9-3/13
+    最後正常輪序者: 3/30-4/3#
+    平日國假補償: 3/9-3/13 (3/10)
     """
     dates = result['dates']
     if not dates:

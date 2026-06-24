@@ -49,13 +49,14 @@ def extract_month_keywords(text: str) -> List[Tuple[str, str]]:
 
     results = []
 
-    # 匹配模式: X月大P1, X月大P2, X月小P1, X月小P2, X月換心
+    # 匹配模式: X月大P1, X月大P2, X月小P1, X月小P2, X月換心, X月待命
     patterns = [
         (r'(\d+)月大P1', '大P1'),
         (r'(\d+)月大P2', '大P2'),
         (r'(\d+)月小P1', '小P1'),
         (r'(\d+)月小P2', '小P2'),
         (r'(\d+)月換心', '換心'),
+        (r'(\d+)月待命', '待命'),
     ]
 
     for pattern, keyword in patterns:
@@ -75,8 +76,25 @@ def _parse_pending_makeup_token(token: str, default_year: int = 2026, column_ind
         return None
 
     normalized = original_text.replace(' ', '').replace('　', '')
+    is_targeted_makeup = bool(re.match(r'^\d{1,2}月補[@\s]*\d{1,2}/\d{1,2}', original_text.strip()))
     normalized = re.sub(r'^(?:待補班|補班|待補|補)[:：@]?', '', normalized)
     normalized = re.sub(r'^\d{1,2}月補@?', '', normalized)
+
+    undated_match = re.match(r'^(?:(大夜|小夜|白班|假日)補|補(大夜|小夜|白班|假日)?)$', normalized or original_text.replace(' ', '').replace('\u3000', ''))
+    if undated_match:
+        shift_type = undated_match.group(1) or undated_match.group(2) or '假日'
+        if shift_type == '假日':
+            shift_type = '白班'
+        return {
+            'dates': [],
+            'shift_type': shift_type,
+            'original_text': original_text,
+            'target_date': None,
+            'target_shift_type': None,
+            'column_index': column_index,
+            'is_targeted_makeup': False,
+            'is_undated_makeup': True,
+        }
 
     shift_match = re.search(r'(大夜|小夜|白班)$', normalized)
     if not shift_match:
@@ -109,7 +127,18 @@ def _parse_pending_makeup_token(token: str, default_year: int = 2026, column_ind
                 target_date = dt
 
     if not dates:
-        return None
+        if '補' not in original_text:
+            return None
+        return {
+            'dates': [],
+            'shift_type': shift_type,
+            'original_text': original_text,
+            'target_date': None,
+            'target_shift_type': None,
+            'column_index': column_index,
+            'is_targeted_makeup': False,
+            'is_undated_makeup': True,
+        }
 
     return {
         'dates': dates,
@@ -118,6 +147,7 @@ def _parse_pending_makeup_token(token: str, default_year: int = 2026, column_ind
         'target_date': target_date,
         'target_shift_type': shift_type,
         'column_index': column_index,
+        'is_targeted_makeup': is_targeted_makeup,
     }
 
 
@@ -275,13 +305,27 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
                 nurse.is_p2[month_str] = keyword  # 保存 '大P2' 或 '小P2'
             elif keyword == '換心':
                 nurse.is_transplant[month_str] = True
+            elif keyword == '待命':
+                nurse.is_standby[month_str] = True
 
         pending_makeups = extract_pending_makeup(field_value, year)
         for makeup in pending_makeups:
+            if makeup.get('is_targeted_makeup'):
+                target_date = makeup.get('target_date')
+                shift_type = makeup.get('target_shift_type') or makeup.get('shift_type')
+                if target_date and shift_type:
+                    nurse.manual_makeup_shift_blocks.append({
+                        'date': target_date,
+                        'shift_type': shift_type,
+                        'note': makeup.get('original_text') or '補班欄指定',
+                    })
+                continue
             if makeup['shift_type'] == '大夜':
                 nurse.pending_night_makeup.append(makeup)
             elif makeup['shift_type'] == '小夜':
                 nurse.pending_small_night_makeup.append(makeup)
+            elif makeup['shift_type'] in ('白班', '假日'):
+                nurse.pending_holiday_makeup.append(makeup)
 
         # 解析婚假與公休日期
         # 特別處理同一個欄位同時包含「婚假」與「公休」的情況，例如：
@@ -357,6 +401,7 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
         night_value_clean = night_value_clean.replace('#', '')
         night_dates = parse_dot_separated_dates(night_value_clean, year)
         nurse.night_shift_dates.extend(night_dates)
+        nurse.manual_night_shift_dates.extend(night_dates)
 
     small_night_value = str(_get_first_value(row_data, ['\u5c0f\u591c', '\u5c0f\u591c\u9031'])).strip()
     if small_night_value and small_night_value != 'nan':
@@ -368,6 +413,7 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
         small_night_value_clean = small_night_value_clean.replace('#', '')
         small_dates = parse_date_range(small_night_value_clean, year)
         nurse.small_night_shift_dates.extend(small_dates)
+        nurse.manual_small_night_shift_dates.extend(small_dates)
 
     return nurse
 
