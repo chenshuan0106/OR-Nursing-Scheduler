@@ -55,7 +55,6 @@ class NurseInfo:
     pending_night_makeup: List[Dict] = field(default_factory=list)  # [{'dates': [...], 'shift_type': '大夜'}, ...]
     pending_small_night_makeup: List[Dict] = field(default_factory=list)  # 小夜待補班
     pending_holiday_makeup: List[Dict] = field(default_factory=list)  # 假日班待補班
-    manual_makeup_shift_blocks: List[Dict] = field(default_factory=list)  # 補班欄手動紀錄占用的日期/班別
 
     # 本月新產生的待補班（因公休跳過，輸出時寫入備註）
     new_pending_makeup: List[Dict] = field(default_factory=list)  # [{'dates': [...], 'shift_type': '大夜'}, ...]

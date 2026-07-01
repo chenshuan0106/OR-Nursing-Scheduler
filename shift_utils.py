@@ -173,6 +173,13 @@ def extract_pending_makeup(text: str, default_year: int = 2026) -> List[Dict[str
     return results
 
 
+def _is_undated_makeup_marker(text: str) -> bool:
+    if not text or not isinstance(text, str):
+        return False
+    normalized = text.strip().replace(' ', '').replace('\u3000', '')
+    return normalized in {'補', '待補', '補班', '待補班'}
+
+
 def extract_date_ranges(text: str, default_year: int = 2026) -> List[datetime]:
     """
     從文字中提取所有日期範圍
@@ -393,27 +400,51 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
 
     night_value = str(_get_first_value(row_data, ['\u5927\u591c'])).strip()
     if night_value and night_value != 'nan':
-        comp_dates, night_value_clean = extract_parenthesized_dates(night_value, year)
-        if comp_dates:
-            nurse.holiday_compensations_used.extend(comp_dates)
-            # 記錄來源：從大夜欄位讀取（上個月的結果，已確定）
-            nurse.night_shift_holiday_compensations.extend(comp_dates)
-        night_value_clean = night_value_clean.replace('#', '')
-        night_dates = parse_dot_separated_dates(night_value_clean, year)
-        nurse.night_shift_dates.extend(night_dates)
-        nurse.manual_night_shift_dates.extend(night_dates)
+        if _is_undated_makeup_marker(night_value):
+            nurse.pending_night_makeup.append({
+                'dates': [],
+                'shift_type': '大夜',
+                'original_text': night_value,
+                'target_date': None,
+                'target_shift_type': None,
+                'column_index': 1,
+                'is_targeted_makeup': False,
+                'is_undated_makeup': True,
+            })
+        else:
+            comp_dates, night_value_clean = extract_parenthesized_dates(night_value, year)
+            if comp_dates:
+                nurse.holiday_compensations_used.extend(comp_dates)
+                # 記錄來源：從大夜欄位讀取（上個月的結果，已確定）
+                nurse.night_shift_holiday_compensations.extend(comp_dates)
+            night_value_clean = night_value_clean.replace('#', '')
+            night_dates = parse_dot_separated_dates(night_value_clean, year)
+            nurse.night_shift_dates.extend(night_dates)
+            nurse.manual_night_shift_dates.extend(night_dates)
 
     small_night_value = str(_get_first_value(row_data, ['\u5c0f\u591c', '\u5c0f\u591c\u9031'])).strip()
     if small_night_value and small_night_value != 'nan':
-        comp_dates, small_night_value_clean = extract_parenthesized_dates(small_night_value, year)
-        if comp_dates:
-            nurse.holiday_compensations_used.extend(comp_dates)
-            # 記錄來源：從小夜週欄位讀取（可能是預排）
-            nurse.small_night_shift_holiday_compensations.extend(comp_dates)
-        small_night_value_clean = small_night_value_clean.replace('#', '')
-        small_dates = parse_date_range(small_night_value_clean, year)
-        nurse.small_night_shift_dates.extend(small_dates)
-        nurse.manual_small_night_shift_dates.extend(small_dates)
+        if _is_undated_makeup_marker(small_night_value):
+            nurse.pending_small_night_makeup.append({
+                'dates': [],
+                'shift_type': '小夜',
+                'original_text': small_night_value,
+                'target_date': None,
+                'target_shift_type': None,
+                'column_index': 1,
+                'is_targeted_makeup': False,
+                'is_undated_makeup': True,
+            })
+        else:
+            comp_dates, small_night_value_clean = extract_parenthesized_dates(small_night_value, year)
+            if comp_dates:
+                nurse.holiday_compensations_used.extend(comp_dates)
+                # 記錄來源：從小夜週欄位讀取（可能是預排）
+                nurse.small_night_shift_holiday_compensations.extend(comp_dates)
+            small_night_value_clean = small_night_value_clean.replace('#', '')
+            small_dates = parse_date_range(small_night_value_clean, year)
+            nurse.small_night_shift_dates.extend(small_dates)
+            nurse.manual_small_night_shift_dates.extend(small_dates)
 
     return nurse
 

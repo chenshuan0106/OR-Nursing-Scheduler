@@ -753,22 +753,7 @@ def schedule_holiday_shifts(
 
     # 追蹤每個人本月是否已經有排過假日班
     assigned_this_month: Set[str] = set()
-    manual_makeup_blocked_slots = {
-        (block.get('date').date(), block.get('shift_type'))
-        for nurse in nurses
-        for block in getattr(nurse, 'manual_makeup_shift_blocks', [])
-        if block.get('date') and block.get('shift_type')
-    }
-
     def has_same_day_assignment(nurse: NurseInfo, slot: HolidayShiftSlot) -> bool:
-        manual_makeup_days = {
-            block.get('date').date()
-            for block in getattr(nurse, 'manual_makeup_shift_blocks', [])
-            if block.get('date')
-        }
-        if slot.date.date() in manual_makeup_days:
-            return True
-
         return any(
             result.nurse.name == nurse.name
             and not result.is_skipped
@@ -848,9 +833,6 @@ def schedule_holiday_shifts(
         all_slots.sort(key=lambda slot: (slot.date, slot_order.get(slot.shift_type_id, 99)))
     
     for slot in all_slots:
-        if (slot.date.date(), slot.shift_name) in manual_makeup_blocked_slots:
-            print(f"  補班欄占用假日格子: {slot.display_text}")
-            continue
 
         # 0. 先檢查這個時段是否被跨月補班佔用
         # 護理長已在上個月班表中手動確認這個班，直接佔位，不做任何衝突檢查
@@ -878,7 +860,6 @@ def schedule_holiday_shifts(
                     is_cross_month_makeup=True,
                 )
                 results.append(result)
-                assigned_this_month.add(nurse.name)
                 print(f"  跨月固定班: {nurse.name} {slot.display_text} [欄{cycle + 1}]")
                 continue  # 此時段已佔用，跳過後續輪值
         
@@ -906,9 +887,7 @@ def schedule_holiday_shifts(
                         is_makeup=True,
                         original_slot_text=original_text,
                     ))
-                    assigned_this_month.add(nurse.name)
                     pending_priority_queue.pop(pending_idx)
-                    last_normal_assigned_name = nurse.name
                     force_text = "手動指定" if is_manual else "優先補班"
                     print(f"  ★ {force_text}: {nurse.name} {slot.display_text} (原{original_text}) [欄{column_index}]")
                     assigned = True
@@ -933,9 +912,7 @@ def schedule_holiday_shifts(
                     is_makeup=True,
                     original_slot_text='跨月固定班延後'
                 ))
-                assigned_this_month.add(nurse.name)
                 deferred_priority_queue.pop(0)
-                last_normal_assigned_name = nurse.name
                 print(f"  ★ 延後跨月補班: {nurse.name} {slot.display_text}")
                 assigned = True
                 continue
@@ -954,9 +931,7 @@ def schedule_holiday_shifts(
                     is_makeup=True,
                     original_slot_text='跨月大夜改補小夜'
                 ))
-                assigned_this_month.add(nurse.name)
                 deferred_small_night_queue.pop(0)
-                last_normal_assigned_name = nurse.name
                 print(f"  ★ 跨月大夜改補小夜: {nurse.name} {slot.display_text}")
                 assigned = True
                 continue
@@ -992,9 +967,7 @@ def schedule_holiday_shifts(
                 is_makeup=True,
                 original_slot_text=original_text,
             ))
-            assigned_this_month.add(nurse.name)
             makeup_queue.pop(queued_idx)
-            last_normal_assigned_name = nurse.name
             print(f"  輪序回補: {nurse.name} {slot.display_text} (原 {original_text})")
             assigned = True
             break
@@ -1038,11 +1011,8 @@ def schedule_holiday_shifts(
                 if can_assign:
                     ot = mq_slot.display_text if mq_slot else '無指定'
                     results.append(HolidayShiftResult(slot=slot, nurse=nurse, column_index=mq_cyc+1, is_makeup=True, original_slot_text=ot))
-                    assigned_this_month.add(nurse.name)
                     makeup_queue.pop(qi)
-                    last_normal_assigned_name = nurse.name
                     print(f"  ★ 隨輪序補班: {nurse.name} {slot.display_text} (原{ot})")
-                    current_index = advance_index(current_index)
                     assigned = True
                     break
 
