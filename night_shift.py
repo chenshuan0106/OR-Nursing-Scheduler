@@ -59,6 +59,13 @@ def should_skip_night_shift(
     if any(d.date() in manual_makeup_days for d in target_dates):
         return True, '補班欄重疊'
 
+    extra_makeup_days = {
+        d.date()
+        for d in getattr(nurse, 'extra_night_makeup_dates', []) + getattr(nurse, 'extra_small_night_makeup_dates', [])
+    }
+    if any(d.date() in extra_makeup_days for d in target_dates):
+        return True, '額外補班重疊'
+
     # 4. 檢查是否超過連續工作天數限制。
     skip, reason = should_skip_for_consecutive_days(
         nurse, target_dates, target_month, target_year, prev_month, next_month
@@ -142,6 +149,29 @@ def _remove_manual_makeup_night_blocks(
     return remaining_groups
 
 
+def _remove_extra_makeup_night_blocks(
+    nurses: List[NurseInfo],
+    night_groups: List[Tuple[List, str]],
+) -> List[Tuple[List, str]]:
+    blocked_days = {
+        d.date()
+        for nurse in nurses
+        for d in getattr(nurse, 'extra_night_makeup_dates', [])
+    }
+    if not blocked_days:
+        return night_groups
+
+    remaining_groups = []
+    for group_dates, group_type in night_groups:
+        remaining_dates = [d for d in group_dates if d.date() not in blocked_days]
+        blocked_in_group = [d for d in group_dates if d.date() in blocked_days]
+        for d in blocked_in_group:
+            print(f"  額外大夜補班已占用，略過正常大夜日期: {d.month}/{d.day}")
+        if remaining_dates:
+            remaining_groups.append((remaining_dates, group_type))
+    return remaining_groups
+
+
 def _has_current_month_night_assignment(
     nurse: NurseInfo,
     results: List[Dict],
@@ -160,6 +190,8 @@ def _should_defer_regular_skip(reason: str) -> bool:
     """Return True when a regular-rotation skip should be retried later."""
     if not reason:
         return True
+    if reason == '額外補班重疊':
+        return False
     if reason in ('55歲以上', '哺乳'):
         return False
     if ('P1' in reason or 'P2' in reason or '換心' in reason) and '衝班' not in reason:
@@ -231,6 +263,7 @@ def schedule_night_shifts(
         nurses, night_groups, next_month
     )
     night_groups = _remove_manual_makeup_night_blocks(nurses, night_groups)
+    night_groups = _remove_extra_makeup_night_blocks(nurses, night_groups)
 
     # 計算上個月。
     prev_month = target_month - 1 if target_month > 1 else 12
@@ -406,12 +439,11 @@ def schedule_night_shifts(
             print(f"  跳過 {nurse.name}: {reason}")
 
             # 身分或特殊條件跳過者需要寫回備註；公休/婚假不列入。
-            if reason not in ('公休前一日', '婚假'):
+            if reason not in ('公休前一日', '婚假', '額外補班重疊'):
                 identity_skipped_nurses.add(nurse.name)
 
             if _should_defer_regular_skip(reason):
                 makeup_queue.append((current_index, group_dates))
-                print("    加入待補班佇列")
 
             current_index = (current_index + 1) % len(nurses)
             attempts += 1

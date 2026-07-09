@@ -276,6 +276,7 @@ def find_last_assigned_holiday_from_excel(
     sheet_name: str,
     target_month: int,
     target_year: int,
+    verbose: bool = True,
 ) -> Optional[str]:
     """
     從 Excel 假日班欄位找到上個月最後排班的人
@@ -369,7 +370,8 @@ def find_last_assigned_holiday_from_excel(
     if candidates:
         selected = sorted(candidates, key=lambda item: (item[0], item[1], item[2]))[-1]
         last_name = selected[3]
-        print(f"假日班定位點（上月最後日期班）: {last_name} ({selected[0].month}/{selected[0].day})")
+        if verbose:
+            print(f"假日班定位點（上月最後日期班）: {last_name} ({selected[0].month}/{selected[0].day})")
         wb.close()
         return last_name
 
@@ -916,7 +918,6 @@ def _write_schedule_sheet(
     # 定義欄位
     columns = [
         '主值', '公休', '備註', '大夜', '小夜週', '額外補班',
-        '補班',
         '假日', '假日', '假日', '假日'
     ]
     
@@ -924,6 +925,7 @@ def _write_schedule_sheet(
     base_font_name = '標楷體'
     header_font = Font(name=base_font_name, bold=True)
     header_fill = PatternFill(start_color='DDDDDD', end_color='DDDDDD', fill_type='solid')
+    extra_makeup_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
     border = Border(
         left=Side(style='thin'),
         right=Side(style='thin'),
@@ -952,7 +954,7 @@ def _write_schedule_sheet(
     for col_idx, col_name in enumerate(columns, 1):
         cell = ws.cell(row=header_row, column=col_idx, value=col_name)
         cell.font = header_font
-        cell.fill = header_fill
+        cell.fill = extra_makeup_fill if col_name == '額外補班' else header_fill
         cell.border = border
         cell.alignment = center_align
     
@@ -973,7 +975,10 @@ def _write_schedule_sheet(
 
     nurse_extra_makeup_results = {}
     for result in extra_makeup_results:
-        name = result['nurse'].name
+        nurse_obj = result.get('nurse') if isinstance(result, dict) else getattr(result, 'nurse', None)
+        if not nurse_obj:
+            continue
+        name = nurse_obj.name
         if name not in nurse_extra_makeup_results:
             nurse_extra_makeup_results[name] = []
         nurse_extra_makeup_results[name].append(result)
@@ -982,6 +987,8 @@ def _write_schedule_sheet(
 
     if holiday_results and nurses:
         for result in holiday_results:
+            if getattr(result, 'is_extra_makeup', False):
+                continue
             name = result.nurse.name
             new_is_comp = getattr(result, 'is_holiday_compensation', False)
             col_num = getattr(result, 'column_index', 1)
@@ -1153,7 +1160,7 @@ def _write_schedule_sheet(
         cell.font = gray_font if is_other_month_remarks else green_font
         cell.alignment = center_align
 
-        # 補班（專屬欄位，放在小夜週與第一個假日欄中間）
+        # 舊 Excel 的補班欄內容併入「額外補班」欄，不再另開一欄。
         makeup_text = nurse.makeup_text or ''
         if makeup_text:
             makeup_text = re.sub(r'\s*[、,;；\n]+\s*', '\n', makeup_text).strip()
@@ -1179,22 +1186,24 @@ def _write_schedule_sheet(
                     makeup_text = re.sub(pattern, '', makeup_text, flags=re.IGNORECASE)
                     makeup_text = re.sub(r'\n\s*\n', '\n', makeup_text).strip()
 
-        makeup_cell = ws.cell(row=row_idx, column=7, value=makeup_text)
-        makeup_cell.border = border
-        makeup_cell.font = gray_font if makeup_text and _is_all_dates_other_month(makeup_text, year, month) else normal_font
-        makeup_cell.alignment = center_align
-
         extra_makeup_lines = []
+        if makeup_text:
+            extra_makeup_lines.extend([line for line in makeup_text.splitlines() if line.strip()])
         for result in nurse_extra_makeup_results.get(nurse.name, []):
-            if result.get('shift_type') == '大夜':
+            shift_type = result.get('shift_type') if isinstance(result, dict) else '假日班'
+            if shift_type == '大夜':
                 from night_shift import format_night_shift_result
                 extra_makeup_lines.append(f"大夜 {format_night_shift_result(result)}")
-            elif result.get('shift_type') == '小夜週':
+            elif shift_type == '小夜週':
                 from small_night_shift import format_small_night_shift_result
                 extra_makeup_lines.append(f"小夜週 {format_small_night_shift_result(result)}")
+            elif hasattr(result, 'slot'):
+                from holiday_shift import format_holiday_shift_result
+                extra_makeup_lines.append(f"假日班 {format_holiday_shift_result(result, month)}")
         extra_makeup_text = '\n'.join(extra_makeup_lines)
         extra_makeup_cell = ws.cell(row=row_idx, column=6, value=extra_makeup_text)
         extra_makeup_cell.border = border
+        extra_makeup_cell.fill = extra_makeup_fill if extra_makeup_text else PatternFill(fill_type=None)
         extra_makeup_cell.font = gray_font if extra_makeup_text and _is_all_dates_other_month(extra_makeup_text, year, month) else blue_font
         extra_makeup_cell.alignment = center_align
         
@@ -1268,9 +1277,9 @@ def _write_schedule_sheet(
         small_night_cell.border = border
         small_night_cell.alignment = no_wrap_center_align
         
-        # 8, 9, 10, 11. 假日班四個欄位
+        # 7, 8, 9, 10. 假日班四個欄位
         for col_num in [1, 2, 3, 4]:
-            col_idx = 7 + col_num  # 第 8, 9, 10, 11 欄
+            col_idx = 6 + col_num  # 第 7, 8, 9, 10 欄
             holiday_cell = ws.cell(row=row_idx, column=col_idx)
             result_list = holiday_assignments.get((nurse.name, col_num))
             
@@ -1339,7 +1348,7 @@ def _write_schedule_sheet(
         data_row += 1
     
     # 調整欄寬 - 確保所有欄位都能容納兩行文字
-    # 主值, 公休, 備註, 大夜, 小夜週, 補班, 額外補班, 假日, 假日, 假日, 假日
+    # 主值, 公休, 備註, 大夜, 小夜週, 額外補班, 假日, 假日, 假日, 假日
     _apply_identity_font(ws, green_font, gray_font, month)
 
     max_col = len(columns)
@@ -1364,7 +1373,7 @@ def _write_schedule_sheet(
             if max_len > column_widths[col - 1]:
                 column_widths[col - 1] = max_len
 
-    min_widths = [8, 12, 16, 14, 12, 12, 14, 12, 12, 12, 12]
+    min_widths = [8, 12, 16, 14, 12, 16, 12, 12, 12, 12]
     max_width = None
     width_by_col = []
     for col_idx, max_len in enumerate(column_widths, 1):
@@ -1386,6 +1395,7 @@ def read_cross_month_makeup_holidays_from_excel(
     sheet_name: str,
     target_month: int,
     target_year: int,
+    verbose: bool = True,
 ) -> Dict[str, List[Dict]]:
     """
     從 Excel 假日班欄位讀取跨月補班記錄。
@@ -1517,7 +1527,8 @@ def read_cross_month_makeup_holidays_from_excel(
                     'original_text': '-',
                     'column_index': 1,
                 })
-                print(f"  讀取跨月跳過記錄: {name} {text}")
+                if verbose:
+                    print(f"  讀取跨月跳過記錄: {name} {text}")
                 continue
 
             normalized_text = text.replace(' ', '').replace('\u3000', '')
@@ -1530,7 +1541,8 @@ def read_cross_month_makeup_holidays_from_excel(
                     'column_index': _pending_makeup_column(col_pos),
                     'is_undated_makeup': True,
                 })
-                print(f"  讀取假日待補班: {name} {text}")
+                if verbose:
+                    print(f"  讀取假日待補班: {name} {text}")
                 continue
 
             # --- 格式1：待補班「X月補」，可選指定日期：「X月補@M/D班別」或「X月補 M/D班別」---
@@ -1569,7 +1581,8 @@ def read_cross_month_makeup_holidays_from_excel(
                     if target_shift_type:
                         pending_record['target_shift_type'] = target_shift_type
                     nurse_makeups[name].append(pending_record)
-                    print(f"  讀取假日待補班: {name} {text}")
+                    if verbose:
+                        print(f"  讀取假日待補班: {name} {text}")
                 continue
 
             # --- 格式1.5：上月最後假日欄的 P/換心/原班，帶到本月對應欄位當跳過記錄 ---
@@ -1583,7 +1596,8 @@ def read_cross_month_makeup_holidays_from_excel(
                         'original_text': text,
                         'column_index': _cross_month_skip_column(col_pos),
                     })
-                    print(f"  讀取跨月跳過記錄: {name} {text}")
+                    if verbose:
+                        print(f"  讀取跨月跳過記錄: {name} {text}")
                 continue
 
             # --- 格式2：有日期有班別「6/7白班」或舊格式「!6/7白班」---
@@ -1609,7 +1623,8 @@ def read_cross_month_makeup_holidays_from_excel(
                                 'original_text': text,
                                 'column_index': _cross_month_skip_column(col_pos),
                             })
-                            print(f"  讀取跨月補班(有日期): {name} {text}")
+                            if verbose:
+                                print(f"  讀取跨月補班(有日期): {name} {text}")
                     except ValueError:
                         pass
 
