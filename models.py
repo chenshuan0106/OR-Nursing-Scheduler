@@ -40,8 +40,6 @@ class NurseInfo:
     small_night_shift_dates: List[datetime] = field(default_factory=list)  # 小夜週日期
     manual_night_shift_dates: List[datetime] = field(default_factory=list)  # 大夜欄自填日期
     manual_small_night_shift_dates: List[datetime] = field(default_factory=list)  # 小夜週欄自填日期
-    extra_night_makeup_dates: List[datetime] = field(default_factory=list)  # 額外補班欄的大夜日期
-    extra_small_night_makeup_dates: List[datetime] = field(default_factory=list)  # 額外補班欄的小夜週日期
     
     # 上月跨月的排班（有#標記的）
     last_month_cross_month_night_dates: List[datetime] = field(default_factory=list)  # 上月跨月的大夜日期
@@ -57,7 +55,6 @@ class NurseInfo:
     pending_night_makeup: List[Dict] = field(default_factory=list)  # [{'dates': [...], 'shift_type': '大夜'}, ...]
     pending_small_night_makeup: List[Dict] = field(default_factory=list)  # 小夜待補班
     pending_holiday_makeup: List[Dict] = field(default_factory=list)  # 假日班待補班
-    holiday_pending_notice: List[Dict] = field(default_factory=list)  # 假日班待補提示/排序資料
 
     # 本月新產生的待補班（因公休跳過，輸出時寫入備註）
     new_pending_makeup: List[Dict] = field(default_factory=list)  # [{'dates': [...], 'shift_type': '大夜'}, ...]

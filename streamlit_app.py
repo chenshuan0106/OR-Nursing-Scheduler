@@ -198,7 +198,7 @@ if modules_loaded:
 
     def get_extra_makeup_entries(sheet_name):
         entries = []
-        for shift_type in ("大夜", "小夜週"):
+        for shift_type in ("大夜", "小夜週", "假日班"):
             entries.extend(st.session_state.get(_extra_makeup_key(sheet_name, shift_type), []))
         return list(entries)
 
@@ -355,10 +355,10 @@ if modules_loaded:
             if not entry.get('nurse_name'):
                 continue
             extra_entries.append({
-                'id': f"manual_makeup|holiday|{entry.get('nurse_name')}|{idx}",
+                'id': f"manual_makeup|auto|{entry.get('nurse_name')}|{idx}",
                 'nurse_name': entry.get('nurse_name'),
                 'shift_type': '假日班',
-                'source': entry.get('note') or '額外假日補班',
+                'source': entry.get('note') or '手動新增補班',
                 'source_type': 'manual_makeup',
             })
         return extra_entries
@@ -431,7 +431,7 @@ if modules_loaded:
                 f"{idx + 1}. {entry.get('nurse_name')} `{entry.get('shift_type')}`"
                 for idx, entry in enumerate(priority_makeup_entries)
             ]
-            notes.append(("info", "本次使用補班順位：" + "、".join(makeup_labels)))
+            notes.append(("info", "本次使用排序補班清單：" + "、".join(makeup_labels)))
 
         if manual_makeup_note:
             notes.append(("info", "本次補班說明：" + manual_makeup_note))
@@ -543,8 +543,8 @@ if modules_loaded:
             if item.get('id') in entry_ids
         ]
 
-        st.markdown(f"**{shift_type}補班順位**")
-        st.caption("先帶入系統已偵測到的待補人員，也可新增順位；不需要輸入補班日期，排序就是本班別補班優先順序。")
+        st.markdown(f"**{shift_type}補班人員清單**")
+        st.caption("先帶入系統已偵測到的待補人員，也可手動新增；不需要輸入補班日期，排序就是本班別補班優先順序。")
 
         if active_detected_entries:
             with st.expander(f"已偵測到的{shift_type}待補", expanded=True):
@@ -558,7 +558,7 @@ if modules_loaded:
         else:
             st.info(f"目前沒有從 Excel 偵測到{shift_type}待補人員。")
 
-        with st.expander(f"新增{shift_type}補班順位", expanded=False):
+        with st.expander("手動新增補班人員", expanded=False):
             add_col1, add_col2 = st.columns([2, 1])
             with add_col1:
                 selected_makeup_nurse = st.selectbox(
@@ -568,7 +568,7 @@ if modules_loaded:
                 )
             with add_col2:
                 st.write("")
-                if st.button(f"加入{shift_type}補班順位", key=f"add_priority_makeup_{shift_type}_{sheet_name}", use_container_width=True):
+                if st.button(f"加入{shift_type}補班", key=f"add_priority_makeup_{shift_type}_{sheet_name}", use_container_width=True):
                     if selected_makeup_nurse == "請選擇":
                         st.warning("請先選擇人員。")
                     else:
@@ -577,7 +577,7 @@ if modules_loaded:
                             'id': f"manual|{shift_type}|{selected_makeup_nurse}|{manual_count}",
                             'nurse_name': selected_makeup_nurse,
                             'shift_type': shift_type,
-                            'source': '新增順位',
+                            'source': '手動新增',
                             'source_type': 'manual',
                         }
                         entries.append(entry)
@@ -585,7 +585,7 @@ if modules_loaded:
                         st.rerun()
 
         if not entries:
-            st.info(f"目前{shift_type}補班順位是空的。")
+            st.info(f"目前{shift_type}補班清單是空的。")
             return
 
         label_to_entry = {
@@ -606,11 +606,11 @@ if modules_loaded:
             if sorted_entries != entries:
                 st.session_state[priority_key] = sorted_entries
                 st.rerun()
-            st.caption("拖曳清單項目可調整補班順位。")
+            st.caption("拖曳清單項目可調整補班志願序。")
         except Exception:
             st.caption("拖曳排序元件尚未載入；目前可先用上移 / 下移調整順序。")
 
-        st.markdown("**目前補班順位**")
+        st.markdown("**目前補班志願序**")
         for idx, item in enumerate(list(st.session_state[priority_key])):
             row_col1, row_col2, row_col3, row_col4 = st.columns([4, 1, 1, 1])
             with row_col1:
@@ -630,7 +630,7 @@ if modules_loaded:
                         st.session_state[removed_key].append(removed_item.get('id'))
                     st.rerun()
 
-        if st.button(f"清除{shift_type}補班順位", key=f"priority_makeup_clear_{shift_type}_{sheet_name}", use_container_width=True):
+        if st.button(f"清除{shift_type}補班清單", key=f"priority_makeup_clear_{shift_type}_{sheet_name}", use_container_width=True):
             st.session_state[removed_key].extend(
                 item.get('id')
                 for item in st.session_state[priority_key]
@@ -644,20 +644,20 @@ if modules_loaded:
         if extra_key not in st.session_state:
             st.session_state[extra_key] = []
 
-        with st.expander(f"額外{shift_type}補班（選填）", expanded=False):
-            st.caption("只指定人員，不指定日期。系統會自動找可排班位，結果寫入 Excel 的「額外補班」欄，不占用正常班別欄位。")
+        with st.expander(f"額外補班（{shift_type}，選填）", expanded=False):
+            st.caption("只指定人員，不指定日期。系統會自動找可排班位，結果寫入 Excel 的「額外補班」欄，不占用正常大夜/小夜週欄位。")
             entries = st.session_state[extra_key]
 
             add_col1, add_col2 = st.columns([2, 1])
             with add_col1:
                 selected_extra_nurse = st.selectbox(
-                    f"選擇額外{shift_type}補班人員",
+                    "選擇額外補班人員",
                     options=["請選擇"] + nurse_names,
                     key=f"extra_makeup_nurse_{shift_type}_{sheet_name}",
                 )
             with add_col2:
                 st.write("")
-                if st.button(f"加入額外{shift_type}補班", key=f"add_extra_makeup_{shift_type}_{sheet_name}", use_container_width=True):
+                if st.button(f"加入額外補班", key=f"add_extra_makeup_{shift_type}_{sheet_name}", use_container_width=True):
                     if selected_extra_nurse == "請選擇":
                         st.warning("請先選擇人員。")
                     else:
@@ -671,7 +671,7 @@ if modules_loaded:
                         st.rerun()
 
             if not entries:
-                st.info(f"目前尚未新增額外{shift_type}補班。")
+                st.info(f"目前尚未新增{shift_type}額外補班。")
                 return
 
             label_to_entry = {
@@ -689,11 +689,11 @@ if modules_loaded:
                 if sorted_entries != entries:
                     st.session_state[extra_key] = sorted_entries
                     st.rerun()
-                st.caption("拖曳清單項目可調整額外補班順序。")
+                st.caption("拖曳清單項目可調整額外補班優先順序。")
             except Exception:
                 st.caption("拖曳排序元件尚未載入；目前可先用上移 / 下移調整順序。")
 
-            st.markdown(f"**目前額外{shift_type}補班順序**")
+            st.markdown("**目前額外補班順序**")
             for idx, item in enumerate(list(st.session_state[extra_key])):
                 row_col1, row_col2, row_col3, row_col4 = st.columns([4, 1, 1, 1])
                 with row_col1:
@@ -711,7 +711,7 @@ if modules_loaded:
                         entries.pop(idx)
                         st.rerun()
 
-            if st.button(f"清除額外{shift_type}補班", key=f"extra_makeup_clear_{shift_type}_{sheet_name}", use_container_width=True):
+            if st.button(f"清除{shift_type}額外補班", key=f"extra_makeup_clear_{shift_type}_{sheet_name}", use_container_width=True):
                 st.session_state[extra_key] = []
                 st.rerun()
 
@@ -779,7 +779,7 @@ if modules_loaded:
                         with st.expander("已讀到的大夜 / 小夜待補", expanded=False):
                             st.table(pending_makeup_rows)
                     if priority_makeup_entries:
-                        with st.expander("本次補班順位", expanded=True):
+                        with st.expander("本次排序補班清單", expanded=True):
                             st.table([
                                 {
                                     "志願序": idx + 1,
@@ -856,8 +856,8 @@ if modules_loaded:
                         carryover_records_by_nurse,
                     )
                     st.markdown("---")
-                    st.markdown("**額外假日補班**")
-                    st.caption("只指定人員，不指定日期或班別；系統會自動在可排的假日班位安排補班，結果會寫入 Excel 的「額外補班」欄。")
+                    st.markdown("**假日額外補班**")
+                    st.caption("只指定人員，不指定日期或班別；系統會在假日待補與一般輪序前，優先尋找可排班位。")
                     manual_past_makeup_key = _manual_past_makeup_key(sheet_name)
                     if manual_past_makeup_key not in st.session_state:
                         st.session_state[manual_past_makeup_key] = []
@@ -875,8 +875,8 @@ if modules_loaded:
                             st.session_state[f"past_makeup_note_{sheet_name}"] = item.get('note', '')
                             st.session_state[loaded_edit_index_key] = current_edit_index
 
-                    with st.expander("新增 / 編輯 額外假日補班", expanded=False):
-                        st.caption("只選人員即可；系統會自動在可排的假日班位安排補班，並以醒目顏色標示在「額外補班」欄。")
+                    with st.expander("新增 / 編輯 假日額外補班", expanded=False):
+                        st.caption("只選人員即可；系統會自動在可排的假日班中安排額外補班。")
                         add_col1, add_col2 = st.columns([2, 2])
                         with add_col1:
                             selected_past_makeup_nurse = st.selectbox(
@@ -888,25 +888,25 @@ if modules_loaded:
                             selected_past_makeup_note = st.text_input(
                                 "說明（選填）",
                                 key=f"past_makeup_note_{sheet_name}",
-                                placeholder="例如：額外假日補班",
+                                placeholder="例如：手動新增補班",
                             )
     
                         action_col1, action_col2, action_col3 = st.columns([1, 1, 1])
                         with action_col1:
-                            if st.button("加入/更新額外補班", key=f"save_past_makeup_{sheet_name}", use_container_width=True):
+                            if st.button("加入/更新補班", key=f"save_past_makeup_{sheet_name}", use_container_width=True):
                                 if selected_past_makeup_nurse == "請選擇":
                                     st.warning("請先選擇人員再新增補班。")
                                 else:
                                     to_save = {
                                         'nurse_name': selected_past_makeup_nurse,
-                                        'note': selected_past_makeup_note.strip() or '額外假日補班',
+                                        'note': selected_past_makeup_note.strip() or '手動新增補班',
                                     }
                                     if st.session_state[edit_index_key] is None:
                                         st.session_state[manual_past_makeup_key].append(to_save)
-                                        st.success(f"已新增額外假日補班：{selected_past_makeup_nurse}")
+                                        st.success(f"已新增假日額外補班：{selected_past_makeup_nurse}")
                                     else:
                                         st.session_state[manual_past_makeup_key][st.session_state[edit_index_key]] = to_save
-                                        st.success("已更新額外假日補班。")
+                                        st.success("已更新補班需求。")
                                         st.session_state[edit_index_key] = None
                                         st.session_state[loaded_edit_index_key] = None
     
@@ -916,13 +916,13 @@ if modules_loaded:
                                 st.session_state[loaded_edit_index_key] = None
     
                         with action_col3:
-                            if st.button("清除本頁面額外假日補班", key=f"clear_past_makeup_{sheet_name}", use_container_width=True):
+                            if st.button("清除本頁面補班需求", key=f"clear_past_makeup_{sheet_name}", use_container_width=True):
                                 st.session_state[manual_past_makeup_key] = []
                                 st.session_state[edit_index_key] = None
                                 st.session_state[loaded_edit_index_key] = None
                                 st.rerun()
     
-                        st.markdown("**目前額外假日補班**")
+                        st.markdown("**目前假日額外補班順序**")
                         entries = st.session_state[manual_past_makeup_key]
                         if entries:
                             for idx, item in enumerate(entries):
@@ -938,14 +938,14 @@ if modules_loaded:
                                         st.rerun()
                                     if st.button("刪除", key=f"delete_past_makeup_{sheet_name}_{idx}", use_container_width=True):
                                         entries.pop(idx)
-                                        st.success("已刪除額外假日補班。")
+                                        st.success("已刪除補班需求。")
                                         st.rerun()
                         else:
-                            st.info("目前尚未新增任何額外假日補班。")
+                            st.info("目前尚未新增任何手動補班需求。")
     
                 with note_tab:
                     st.markdown("**補班說明（選填）**")
-                    st.caption("若補班順位或額外補班欄未能完整描述需求，可在此填寫本次排班的補班備註。")
+                    st.caption("若 Excel 補班欄未能完整描述補班需求，可在此填寫本次排班的補班備註。")
                     makeup_text_key = _makeup_note_key(sheet_name)
                     if makeup_text_key not in st.session_state:
                         st.session_state[makeup_text_key] = ''
@@ -965,9 +965,14 @@ if modules_loaded:
                 rows.append({
                     "日期": format_night_shift_result(result),
                     "姓名": result['nurse'].name,
-                    "類型": "補班" if result.get('is_makeup') else "正常",
+                    "類型": (
+                        "第二輪"
+                        if result.get('is_second_round')
+                        else ("補班" if result.get('is_makeup') else "正常")
+                    ),
                     "狀態": _status_tags(
                         "下月" if result.get('is_next_month') else '',
+                        "第二輪" if result.get('is_second_round') else '',
                         "定位點" if result.get('is_last_normal') else '',
                     ),
                 })
@@ -1342,9 +1347,6 @@ if modules_loaded:
                                         sheet_name,
                                         year,
                                         month,
-                                        last_assigned_night_name=pre_schedule_check.get('last_night'),
-                                        last_assigned_small_night_name=pre_schedule_check.get('last_small_night'),
-                                        last_assigned_holiday_name=pre_schedule_check.get('last_holiday'),
                                         regular_start_night_name=manual_anchor_overrides.get('night'),
                                         regular_start_small_night_name=manual_anchor_overrides.get('small_night'),
                                         regular_start_holiday_name=manual_anchor_overrides.get('holiday'),
@@ -1352,7 +1354,6 @@ if modules_loaded:
                                         priority_makeup_entries=priority_makeup_entries,
                                         extra_makeup_entries=extra_makeup_entries,
                                         manual_makeup_note=manual_makeup_note,
-                                        pre_schedule_check=pre_schedule_check,
                                     )
 
                                     all_results[sheet_name] = {
@@ -1385,7 +1386,14 @@ if modules_loaded:
                                 st.text(output_text[-5000:])
                             log_output.write(output_text)
 
-                    # 產生輸出檔案
+                    # 產生輸出檔案前做靜默稽核；只在有問題時顯示並停止輸出。
+                    from schedule_validation import validate_schedule_results
+                    validation_errors = validate_schedule_results(all_results, year, month)
+                    if validation_errors:
+                        status_text.text("⛔ 排班稽核未通過，已停止輸出")
+                        st.error("發現排班衝突：\n\n" + "\n\n".join(f"- {item}" for item in validation_errors))
+                        st.stop()
+
                     status_text.text("正在產生排班結果...")
                     progress_bar.progress(0.9)
 

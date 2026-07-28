@@ -240,9 +240,9 @@ def build_pre_schedule_check(
     nurse_names = [nurse.name for nurse in nurses]
     last_night = find_last_assigned_from_excel(filepath, sheet_name, month, year, nurse_names)
     last_small_night = find_last_assigned_small_night_from_excel(filepath, sheet_name, month, year)
-    last_holiday = find_last_assigned_holiday_from_excel(filepath, sheet_name, month, year, verbose=False)
+    last_holiday = find_last_assigned_holiday_from_excel(filepath, sheet_name, month, year)
     from excel_handler import read_cross_month_makeup_holidays_from_excel
-    cross_month_makeups = read_cross_month_makeup_holidays_from_excel(filepath, sheet_name, month, year, verbose=False)
+    cross_month_makeups = read_cross_month_makeup_holidays_from_excel(filepath, sheet_name, month, year)
     plain_holiday_makeups = _read_plain_holiday_makeup_markers(filepath, sheet_name)
     for nurse_name, records in plain_holiday_makeups.items():
         existing = cross_month_makeups.setdefault(nurse_name, [])
@@ -353,6 +353,9 @@ def print_night_shift_preview(results: List[Dict], month: int, sheet_name: str):
         # 補班標記
         if result.get('is_makeup'):
             marks.append('【補班】')
+
+        if result.get('is_second_round'):
+            marks.append('【第二輪】')
 
         if result.get('has_saturday'):
             marks.append('星期六(藍)')
@@ -538,8 +541,12 @@ def _schedule_extra_makeup_entries(
     month: int,
     scheduled_night_results: Optional[List[Dict]] = None,
     scheduled_small_night_results: Optional[List[Dict]] = None,
+    target_shift_type: Optional[str] = None,
 ) -> List[Dict]:
-    """Schedule optional extra makeup into an independent output column."""
+    """Schedule optional extra makeup into an independent output column.
+    
+    target_shift_type: If specified, only process entries for this shift type ('大夜', '小夜週', etc.)
+    """
     if not extra_makeup_entries:
         return []
 
@@ -551,6 +558,14 @@ def _schedule_extra_makeup_entries(
         '大夜': set(),
         '小夜週': set(),
     }
+    for result in scheduled_night_results or []:
+        result_dates = result.get('dates') or []
+        if result_dates:
+            used_by_shift['大夜'].add(tuple(d.date() for d in result_dates))
+    for result in scheduled_small_night_results or []:
+        result_dates = result.get('dates') or []
+        if result_dates:
+            used_by_shift['小夜週'].add(tuple(d.date() for d in result_dates))
 
     for order, entry in enumerate(extra_makeup_entries, 1):
         nurse = nurse_by_name.get(entry.get('nurse_name'))
@@ -563,6 +578,9 @@ def _schedule_extra_makeup_entries(
             for candidate_shift_type in candidate_shift_types
             if candidate_shift_type in ('大夜', '小夜週')
         ]
+        # 如果指定了目標班別，只處理該班別的額外補班
+        if target_shift_type:
+            candidate_shift_types = [s for s in candidate_shift_types if s == target_shift_type]
         if not candidate_shift_types:
             continue
 
@@ -574,6 +592,10 @@ def _schedule_extra_makeup_entries(
                 else _small_night_groups_with_next_month(year, month)
             )
             for group_dates, group_type in groups:
+                # 額外補班是過去積欠的班，必須盡快在目標月份完成。
+                # 不使用跨月班組，也不借用下月第一組預排。
+                if any(d.year != year or d.month != month for d in group_dates):
+                    continue
                 group_key = tuple(d.date() for d in group_dates)
                 if group_key in used_by_shift[candidate_shift_type]:
                     continue
@@ -617,10 +639,8 @@ def _schedule_extra_makeup_entries(
                 results.append(result)
                 used_by_shift[candidate_shift_type].add(group_key)
                 if candidate_shift_type == '大夜':
-                    nurse.extra_night_makeup_dates.extend(group_dates)
                     nurse.night_shift_dates.extend(group_dates)
                 else:
-                    nurse.extra_small_night_makeup_dates.extend(group_dates)
                     nurse.small_night_shift_dates.extend(group_dates)
                 print(f"  額外補班: {nurse.name} / {candidate_shift_type} / {format_dates_to_dot_string(group_dates)}")
                 assigned = True
@@ -633,40 +653,6 @@ def _schedule_extra_makeup_entries(
 
     results.sort(key=lambda result: (min(result['dates']) if result.get('dates') else datetime.max, result.get('priority_order', 0)))
     return results
-
-
-def _apply_extra_holiday_makeup_entries(
-    nurses: List[NurseInfo],
-    extra_makeup_entries: Optional[List[Dict[str, Any]]],
-) -> None:
-    """Feed manually added holiday extra makeup into the holiday scheduler."""
-    if not extra_makeup_entries:
-        return
-
-    nurse_by_name = {nurse.name: nurse for nurse in nurses}
-    holiday_entries = [
-        entry for entry in extra_makeup_entries
-        if entry.get('shift_type') in ('假日', '假日班', '白班')
-        or entry.get('source_type') == 'manual_makeup'
-    ]
-    for order, entry in enumerate(holiday_entries, 1):
-        nurse = nurse_by_name.get(entry.get('nurse_name'))
-        if not nurse:
-            continue
-        record = {
-            'dates': [],
-            'shift_type': '假日',
-            'original_text': entry.get('source') or '額外補班',
-            'column_index': 1,
-            'type': 'pending',
-            'is_extra_makeup': True,
-            'priority_order': order,
-        }
-        if not hasattr(nurse, 'holiday_pending_notice'):
-            nurse.holiday_pending_notice = []
-        nurse.pending_holiday_makeup.append(record)
-        nurse.holiday_pending_notice.append(record)
-        print(f"  額外假日補班: {nurse.name} / {record['original_text']}")
 
 
 def process_sheet(
@@ -684,7 +670,6 @@ def process_sheet(
     priority_makeup_entries: Optional[List[Dict[str, Any]]] = None,
     extra_makeup_entries: Optional[List[Dict[str, Any]]] = None,
     manual_makeup_note: str = '',
-    pre_schedule_check: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[NurseInfo], List[Dict], List[Dict], List, List[Dict], str, str, str, set, set]:
     """
     處理單一頁籤的排班
@@ -735,19 +720,9 @@ def process_sheet(
                     print(f"    移除非本月補償 {d.month}/{d.day}")
 
     # 讀取跨月補班記錄（!開頭的假日班）
-    cached_cross_month_makeups = {}
-    if pre_schedule_check:
-        cached_cross_month_makeups = pre_schedule_check.get('carryover_records_by_nurse') or {}
-
-    if cached_cross_month_makeups:
-        cross_month_makeups = {
-            nurse_name: [dict(record) for record in records]
-            for nurse_name, records in cached_cross_month_makeups.items()
-        }
-    else:
-        print("讀取跨月補班記錄...")
-        from excel_handler import read_cross_month_makeup_holidays_from_excel
-        cross_month_makeups = read_cross_month_makeup_holidays_from_excel(filepath, sheet_name, month, year)
+    print("讀取跨月補班記錄...")
+    from excel_handler import read_cross_month_makeup_holidays_from_excel
+    cross_month_makeups = read_cross_month_makeup_holidays_from_excel(filepath, sheet_name, month, year)
     
     # 填充到每個護理人員
     # cross_month_makeups 的每筆記錄有 type: 'fixed' 或 'pending'
@@ -775,23 +750,33 @@ def process_sheet(
         print(f"  頁籤 {sheet_name} 沒有護理人員資料，跳過")
         return [], [], [], [], [], '', '', '', set(), set()
 
-    extra_makeup_results = _schedule_extra_makeup_entries(
+    # 初始化結果容器
+    all_extra_makeup_results = []
+
+    # ===========================
+    # 大夜班流程：額外補班 → 補班 → 定位點輪續
+    # ===========================
+    print("\n========== 大夜班排班流程 ==========")
+    
+    # 1. 大夜班額外補班
+    print("開始大夜班額外補班...")
+    night_extra_makeup_results = _schedule_extra_makeup_entries(
         nurses,
         extra_makeup_entries,
         year,
         month,
+        scheduled_night_results=[],
+        scheduled_small_night_results=[],
+        target_shift_type='大夜',
     )
-
-    # ===========================
-    # 1. 大夜班排班（第一步）
-    # ===========================
-    # 如果沒有指定上月最後排班者，從 Excel 大夜欄自動讀取
+    all_extra_makeup_results.extend(night_extra_makeup_results)
+    
+    # 2. 大夜班定位點輪續（包含補班，補班已在 _apply_priority_makeup_entries 中標記）
     if not last_assigned_night_name:
         last_assigned_night_name = find_last_assigned_from_excel(filepath, sheet_name, month, year)
         if last_assigned_night_name:
             print(f"從 Excel 讀取到大夜班上個月最後排班: {last_assigned_night_name}")
 
-    # 找到上個月最後排班的人的索引
     last_night_index = find_last_assigned_index(nurses, last_assigned_night_name)
     regular_night_start_index = find_last_assigned_index(nurses, regular_start_night_name)
     if last_assigned_night_name and last_night_index >= 0:
@@ -799,25 +784,41 @@ def process_sheet(
     elif last_assigned_night_name:
         print(f"警告: 找不到 {last_assigned_night_name}，從第一個人開始排")
 
-    # 執行大夜班排班
-    print("開始大夜班排班...")
+    print("開始大夜班定位點輪續排班（含補班）...")
     night_results, night_last_normal_name, night_identity_skipped = schedule_night_shifts(
-        nurses, year, month, last_night_index, regular_start_index=regular_night_start_index
+        nurses,
+        year,
+        month,
+        last_night_index,
+        regular_start_index=regular_night_start_index,
+        reserved_results=night_extra_makeup_results,
     )
-
-    # 預覽大夜班結果
     print_night_shift_preview(night_results, month, sheet_name)
 
     # ===========================
-    # 2. 小夜班排班（第二步）
+    # 小夜班流程：額外補班 → 補班 → 定位點輪續
     # ===========================
-    # 如果沒有指定上月最後排班者，從 Excel 小夜週欄自動讀取
+    print("\n========== 小夜班排班流程 ==========")
+    
+    # 1. 小夜班額外補班
+    print("開始小夜班額外補班...")
+    small_night_extra_makeup_results = _schedule_extra_makeup_entries(
+        nurses,
+        extra_makeup_entries,
+        year,
+        month,
+        scheduled_night_results=night_results,
+        scheduled_small_night_results=[],
+        target_shift_type='小夜週',
+    )
+    all_extra_makeup_results.extend(small_night_extra_makeup_results)
+    
+    # 2. 小夜班定位點輪續（包含補班）
     if not last_assigned_small_night_name:
         last_assigned_small_night_name = find_last_assigned_small_night_from_excel(filepath, sheet_name, month, year)
         if last_assigned_small_night_name:
             print(f"從 Excel 讀取到小夜班上個月最後排班: {last_assigned_small_night_name}")
 
-    # 找到上個月最後排班的人的索引
     last_small_night_index = find_last_assigned_index(nurses, last_assigned_small_night_name)
     regular_small_night_start_index = find_last_assigned_index(nurses, regular_start_small_night_name)
     if last_assigned_small_night_name and last_small_night_index >= 0:
@@ -825,42 +826,31 @@ def process_sheet(
     elif last_assigned_small_night_name:
         print(f"警告: 找不到 {last_assigned_small_night_name}，從第一個人開始排")
 
-    # 執行小夜班排班
-    print("開始小夜班排班...")
+    print("開始小夜班定位點輪續排班（含補班）...")
     small_night_results, small_night_last_normal_name, small_night_identity_skipped = schedule_small_night_shifts(
-        nurses, year, month, last_small_night_index, regular_start_index=regular_small_night_start_index
+        nurses,
+        year,
+        month,
+        last_small_night_index,
+        regular_start_index=regular_small_night_start_index,
+        reserved_results=small_night_extra_makeup_results,
     )
-
-    # 預覽小夜班結果
     print_small_night_shift_preview(small_night_results, month, sheet_name)
 
-    for result in extra_makeup_results:
-        nurse = result.get('nurse')
-        dates = result.get('dates') or []
-        if not nurse or not dates:
-            continue
-        if result.get('shift_type') == '大夜':
-            existing_days = {d.date() for d in nurse.night_shift_dates}
-            nurse.night_shift_dates.extend(d for d in dates if d.date() not in existing_days)
-        elif result.get('shift_type') == '小夜週':
-            existing_days = {d.date() for d in nurse.small_night_shift_dates}
-            nurse.small_night_shift_dates.extend(d for d in dates if d.date() not in existing_days)
-
-    _apply_extra_holiday_makeup_entries(nurses, extra_makeup_entries)
-
     # ===========================
-    # 3. 假日班排班（第三步，需要大夜和小夜的結果）
+    # 假日班流程：額外補班 → 補班 → 定位點輪續
     # ===========================
-    # 如果沒有指定上月最後排班者，從 Excel 假日班欄位自動讀取
+    print("\n========== 假日班排班流程 ==========")
+    
+    # 1. 假日班額外補班
+    print("開始假日班額外補班...")
+    
+    # 2. 假日班定位點輪續（包含補班）
     if not last_assigned_holiday_name:
-        if pre_schedule_check:
-            last_assigned_holiday_name = pre_schedule_check.get('last_holiday') or None
-        if not last_assigned_holiday_name:
-            last_assigned_holiday_name = find_last_assigned_holiday_from_excel(filepath, sheet_name, month, year)
+        last_assigned_holiday_name = find_last_assigned_holiday_from_excel(filepath, sheet_name, month, year)
         if last_assigned_holiday_name:
             print(f"從 Excel 讀取到假日班上個月最後排班: {last_assigned_holiday_name}")
 
-    # 找到上個月最後排班的人的索引
     last_holiday_index = find_last_assigned_index(nurses, last_assigned_holiday_name)
     regular_holiday_start_index = find_last_assigned_index(nurses, regular_start_holiday_name)
     if last_assigned_holiday_name and last_holiday_index >= 0:
@@ -868,17 +858,30 @@ def process_sheet(
     elif last_assigned_holiday_name:
         print(f"警告: 找不到 {last_assigned_holiday_name}，從第一個人開始排")
 
-    # 執行假日班排班
-    print("開始假日班排班...")
+    print("開始假日班定位點輪續排班（含補班）...")
     holiday_results, holiday_last_normal_name = schedule_holiday_shifts(
-        nurses, year, month, last_holiday_index, regular_start_index=regular_holiday_start_index
+        nurses,
+        year,
+        month,
+        last_holiday_index,
+        regular_start_index=regular_holiday_start_index,
+        extra_makeup_entries=extra_makeup_entries,
     )
-    extra_makeup_results.extend([
-        result for result in holiday_results
-        if getattr(result, 'is_extra_makeup', False)
-    ])
-
-    # 預覽假日班結果
+    holiday_extra_makeup_results = []
+    regular_holiday_results = []
+    for result in holiday_results:
+        if result.is_extra_makeup:
+            holiday_extra_makeup_results.append({
+                'nurse': result.nurse,
+                'dates': [result.slot.date],
+                'shift_type': '假日班',
+                'holiday_result': result,
+                'is_extra_makeup': True,
+            })
+        else:
+            regular_holiday_results.append(result)
+    holiday_results = regular_holiday_results
+    all_extra_makeup_results.extend(holiday_extra_makeup_results)
     print_holiday_shift_preview(holiday_results, month, sheet_name)
 
     return (
@@ -886,7 +889,7 @@ def process_sheet(
         night_results,
         small_night_results,
         holiday_results,
-        extra_makeup_results,
+        all_extra_makeup_results,
         night_last_normal_name,
         small_night_last_normal_name,
         holiday_last_normal_name,
@@ -964,10 +967,6 @@ def main():
             sheet_name,
             year,
             month,
-            last_assigned_night_name=pre_schedule_check.get('last_night'),
-            last_assigned_small_night_name=pre_schedule_check.get('last_small_night'),
-            last_assigned_holiday_name=pre_schedule_check.get('last_holiday'),
-            pre_schedule_check=pre_schedule_check,
         )
 
         all_results[sheet_name] = {
@@ -982,11 +981,20 @@ def main():
             'night_identity_skipped': night_identity_skipped,
             'small_night_identity_skipped': small_night_identity_skipped,
             'pre_schedule_check': pre_schedule_check,
+            'extra_makeup_entries': [],
         }
 
     # 輸出到新的 Excel（多頁籤）
     output_file = f"排班結果_{roc_year}年{month}月.xlsx"
     title = f"臺北榮民總醫院護理部思源手術室{roc_year}年{month}月值班表"
+
+    from schedule_validation import validate_schedule_results
+    validation_errors = validate_schedule_results(all_results, year, month)
+    if validation_errors:
+        print("\n排班稽核未通過，已停止輸出：")
+        for error in validation_errors:
+            print(f"  - {error}")
+        return
 
     create_schedule_excel_multi_sheet(output_file, title, all_results, year, month)
     print(f"\n排班結果已輸出到: {output_file}")

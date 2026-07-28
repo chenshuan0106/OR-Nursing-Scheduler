@@ -12,6 +12,7 @@ from date_utils import (
     parse_date_range,
     would_cause_consecutive_7_days,
     get_p_shift_dates_for_month,
+    is_holiday,
 )
 
 
@@ -552,29 +553,64 @@ def should_skip_for_consecutive_days(
     next_month: int = None,
 ) -> Tuple[bool, str]:
     """
-    檢查是否因連續7天上班而跳過
+    檢查加入目標班後是否會造成連續 7 天上班。
+
+    同時計入目標日期前後的正常平日班、前後月 P1/P2/換心班，以及
+    已排定的大夜和小夜週，避免跨月衝突只在最終稽核才被發現。
     """
-    month_key = f'{target_month}月'
-    
-    if nurse.is_p2.get(month_key):
-        p2_dates = get_p_shift_dates_for_month(target_year, target_month, '大P2')
-        if would_cause_consecutive_7_days(p2_dates, target_dates):
-            return True, f'{month_key}P2衝班'
-    
-    if next_month:
-        next_month_key = f'{next_month}月'
-        next_year = target_year if next_month > target_month else target_year + 1
-        if nurse.is_p1.get(next_month_key):
-            p1_dates = get_p_shift_dates_for_month(next_year, next_month, '大P1')
-            if would_cause_consecutive_7_days(p1_dates, target_dates):
-                return True, f'{next_month_key}P1衝班'
-    
-    if prev_month:
-        prev_month_key = f'{prev_month}月'
-        prev_year = target_year if prev_month < target_month else target_year - 1
-        if nurse.is_p2.get(prev_month_key):
-            p2_dates = get_p_shift_dates_for_month(prev_year, prev_month, '大P2')
-            if would_cause_consecutive_7_days(p2_dates, target_dates):
-                return True, f'{prev_month_key}P2衝班'
-    
+    if not target_dates:
+        return False, ''
+
+    scan_start = min(target_dates) - timedelta(days=6)
+    scan_end = max(target_dates) + timedelta(days=6)
+    leave_days = {
+        day.date()
+        for day in list(nurse.leave_dates) + list(nurse.wedding_leave_dates)
+    }
+
+    existing_dates = []
+    current = scan_start
+    while current <= scan_end:
+        if (
+            current.weekday() < 5
+            and not is_holiday(current)
+            and current.date() not in leave_days
+        ):
+            existing_dates.append(current)
+        current += timedelta(days=1)
+
+    existing_dates.extend(
+        day
+        for day in list(nurse.night_shift_dates) + list(nurse.small_night_shift_dates)
+        if scan_start.date() <= day.date() <= scan_end.date()
+    )
+
+    months_to_check = set()
+    current = datetime(scan_start.year, scan_start.month, 1)
+    while current <= scan_end:
+        months_to_check.add((current.year, current.month))
+        if current.month == 12:
+            current = datetime(current.year + 1, 1, 1)
+        else:
+            current = datetime(current.year, current.month + 1, 1)
+
+    for check_year, check_month in months_to_check:
+        month_key = f'{check_month}月'
+        shift_types = []
+        if nurse.is_transplant.get(month_key):
+            shift_types.append('換心')
+        p1_value = nurse.is_p1.get(month_key)
+        if p1_value:
+            shift_types.append(p1_value if isinstance(p1_value, str) else '大P1')
+        p2_value = nurse.is_p2.get(month_key)
+        if p2_value:
+            shift_types.append(p2_value if isinstance(p2_value, str) else '大P2')
+        for shift_type in shift_types:
+            existing_dates.extend(
+                get_p_shift_dates_for_month(check_year, check_month, shift_type)
+            )
+
+    if would_cause_consecutive_7_days(existing_dates, target_dates):
+        return True, '連續上班達 7 天'
+
     return False, ''

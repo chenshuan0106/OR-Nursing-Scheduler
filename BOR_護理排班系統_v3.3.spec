@@ -1,9 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('streamlit_app.py', '.'), ('config.py', '.'), ('date_utils.py', '.'), ('excel_handler.py', '.'), ('holiday_shift.py', '.'), ('main.py', '.'), ('models.py', '.'), ('night_shift.py', '.'), ('shift_utils.py', '.'), ('small_night_shift.py', '.'), ('compare_schedule.py', '.'), ('holidays_config.json', '.')]
+datas = [('streamlit_app.py', '.'), ('holidays_config.json', '.')]
 binaries = []
-hiddenimports = ['streamlit', 'openpyxl']
+hiddenimports = ['streamlit', 'openpyxl', 'streamlit_sortables', 'config', 'date_utils', 'excel_handler', 'main', 'models', 'night_shift', 'small_night_shift', 'holiday_shift', 'schedule_validation', 'shift_utils']
 tmp_ret = collect_all('streamlit')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
@@ -29,7 +29,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='BOR_護理排班系統_v3.2',
+    name='BOR_護理排班系統_v3.3',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
