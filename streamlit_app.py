@@ -848,6 +848,19 @@ if modules_loaded:
                     render_extra_makeup_section(sheet_name, nurse_names, "小夜週")
 
                 with holiday_tab:
+                    with st.expander("標記還班（上月上過國定假日，跳過一次）", expanded=False):
+                        key = f"return_skip_{sheet_name}"
+                        if key not in st.session_state:
+                            st.session_state[key] = []
+                        selected_return_skip = st.multiselect(
+                            "選擇要標記還班的人員",
+                            options=nurse_names,
+                            default=st.session_state.get(key, []),
+                            key=f"return_skip_select_{sheet_name}",
+                        )
+                        st.session_state[key] = selected_return_skip
+                        st.caption("標記者在本月遇到假日班時可跳過一次（系統會自動消耗標記）。")
+
                     render_priority_makeup_section(
                         sheet_name,
                         nurses,
@@ -1354,6 +1367,7 @@ if modules_loaded:
                                         priority_makeup_entries=priority_makeup_entries,
                                         extra_makeup_entries=extra_makeup_entries,
                                         manual_makeup_note=manual_makeup_note,
+                                        return_skip_names=st.session_state.get(f"return_skip_{sheet_name}", []),
                                     )
 
                                     all_results[sheet_name] = {

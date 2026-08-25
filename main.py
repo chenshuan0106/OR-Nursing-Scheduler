@@ -670,6 +670,7 @@ def process_sheet(
     priority_makeup_entries: Optional[List[Dict[str, Any]]] = None,
     extra_makeup_entries: Optional[List[Dict[str, Any]]] = None,
     manual_makeup_note: str = '',
+    return_skip_names: Optional[List[str]] = None,
 ) -> Tuple[List[NurseInfo], List[Dict], List[Dict], List, List[Dict], str, str, str, set, set]:
     """
     處理單一頁籤的排班
@@ -690,6 +691,13 @@ def process_sheet(
         nurse = parse_nurse_info_from_row(row_data, row_data.get('_row_index', 0), year)
         if nurse:
             nurses.append(nurse)
+
+    # 如果傳入 UI 標記的還班名單，套用到對應的護理人員（以月份 key 存放）
+    if return_skip_names:
+        month_key = f'{month}月'
+        for nurse in nurses:
+            if nurse.name in return_skip_names:
+                nurse.return_skip[month_key] = True
 
     print(f"讀取到 {len(nurses)} 位護理人員")
 

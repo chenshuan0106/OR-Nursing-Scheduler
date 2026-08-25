@@ -67,6 +67,12 @@ class NurseInfo:
     # 上月的跨月補班記錄
     previous_month_cross_month_makeup_holidays: List[Dict] = field(default_factory=list)
 
+    # 還班標記：用來記錄哪些月份需要「跳過一次」假日值班（例如：上個月上過國定假日，當月還班）
+    # 格式: {'3月': True}
+    return_skip: Dict[str, bool] = field(default_factory=dict)
+    # 已使用的還班記錄（避免同一人被跳過多次）
+    return_skip_used: Dict[str, bool] = field(default_factory=dict)
+
     def __post_init__(self):
         # 1. 優化：確保預設為 dict/list 的欄位如果是 None，會被安全地初始化
         # (雖然 default_factory 通常不會給 None，但若從外部直接傳入 None 還是會出錯，加強防呆)

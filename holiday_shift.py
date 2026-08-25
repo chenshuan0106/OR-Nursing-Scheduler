@@ -697,7 +697,13 @@ def check_should_skip_holiday_shift(
     if needs_adjust:
         return SkipInfo(True, reason, True, adjust_type)
 
-    # 7. 檢查國定假日補償（可跳過，不用補，但每人只能跳過一次）
+    # 7. 檢查是否有手動標記的「還班」需求（由 UI 標記）
+    # 如果當月有還班標記且尚未使用，則跳過一次假日值班（不需補班）
+    month_key = f'{slot.date.month}月'
+    if getattr(nurse, 'return_skip', {}).get(month_key) and not getattr(nurse, 'return_skip_used', {}).get(month_key):
+        return SkipInfo(True, '還班', False, is_compensation=True)
+
+    # 8. 檢查國定假日補償（可跳過，不用補，但每人只能跳過一次）
     # 注意：國假補償放在最後，只有在沒有其他硬性衝突時才會觸發
     if check_compensation:
         compensation = get_holiday_compensation_for_slot(nurse, slot, used_compensations)
@@ -1186,6 +1192,33 @@ def schedule_holiday_shifts(
                 
                 # 處理國定假日補償
                 if skip_info.is_compensation:
+                    # 特殊處理：如果是 UI 標記的「還班」，直接消耗標記並產生跳過記錄
+                    if skip_info.reason == '還班':
+                        month_key = f"{slot.date.month}月"
+                        # 標記為已使用
+                        nurse.return_skip_used[month_key] = True
+                        # 產生跳過記錄
+                        result = HolidayShiftResult(
+                            slot=slot,
+                            nurse=nurse,
+                            column_index=cycle + 1,
+                            is_skipped=True,
+                            skip_reason='還班',
+                        )
+                        results.append(result)
+                        print(f"  {nurse.name} 還班跳過：已消耗還班標記")
+                        # 若此人已在待補佇列，從佇列移除一筆
+                        makeup_entry_idx = None
+                        for i, entry in enumerate(makeup_queue):
+                            if entry[0] == current_index:
+                                makeup_entry_idx = i
+                                break
+                        if makeup_entry_idx is not None:
+                            makeup_queue.pop(makeup_entry_idx)
+                            print(f"    -> 還班抵消待補班，從佇列中移除 {nurse.name} 的 1 筆記錄")
+                        current_index = advance_index(current_index)
+                        attempts += 1
+                        continue
                     compensation = get_holiday_compensation_for_slot(nurse, slot, used_compensations)
                     if compensation:
                         # 取得假日班的日期和平日國定假日的日期

@@ -465,9 +465,9 @@ def _write_pre_schedule_check_sheet(
     base_font_name = '標楷體'
     header_font = Font(name=base_font_name, bold=True)
     title_font = Font(name=base_font_name, bold=True, size=14)
-    normal_font = Font(name=base_font_name)
-    marker_font = Font(name=base_font_name, bold=True, color='FF0000')
-    warning_font = Font(name=base_font_name, color='FF0000')
+    normal_font = Font(name=base_font_name, size=11)
+    marker_font = Font(name=base_font_name, bold=True, color='FF0000', size=11)
+    warning_font = Font(name=base_font_name, color='FF0000', size=11)
     header_fill = PatternFill(start_color='DDDDDD', end_color='DDDDDD', fill_type='solid')
     section_fill = PatternFill(start_color='EAF2F8', end_color='EAF2F8', fill_type='solid')
     marker_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
@@ -499,7 +499,12 @@ def _write_pre_schedule_check_sheet(
     max_col = max(len(detail_columns), len(summary_columns))
     ws['A1'] = f'{title} - 排班前核對'
     ws['A1'].font = title_font
-    ws['A1'].alignment = center_align
+    ws['A1'].alignment = Alignment(
+        horizontal='center',
+        vertical='center',
+        shrink_to_fit=True,
+    )
+    ws.row_dimensions[1].height = 28
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
 
     ws['A2'] = f'目標月份：{year}年{month}月'
@@ -919,7 +924,7 @@ def _write_schedule_sheet(
     small_night_identity_skipped = results.get('small_night_identity_skipped', set())
     
     # 只有當該類別有額外補班時才顯示對應欄位；順序為：
-    # 大夜額外補班 → 大夜 → 小夜額外補班 → 小夜週 → 假日額外補班 → 假日(4 欄) → 補班
+    # 大夜額外補班 → 大夜 → 小夜額外補班 → 小夜週 → 假日額外補班 → 假日(4 欄)
     has_night_extra = any(r.get('shift_type') == '大夜' for r in extra_makeup_results)
     has_small_extra = any(r.get('shift_type') == '小夜週' for r in extra_makeup_results)
     has_holiday_extra = any(r.get('shift_type') == '假日班' for r in extra_makeup_results)
@@ -945,12 +950,10 @@ def _write_schedule_sheet(
     for i in range(1, 5):
         columns.append(f'假日{i}')
         display_headers.append('假日')
-    columns.append('補班')
-    display_headers.append('補班')
     
     # 樣式定義 - 使用標楷體
     base_font_name = '標楷體'
-    header_font = Font(name=base_font_name, bold=True)
+    header_font = Font(name=base_font_name, bold=True, size=13)
     header_fill = PatternFill(start_color='DDDDDD', end_color='DDDDDD', fill_type='solid')
     border = Border(
         left=Side(style='thin'),
@@ -962,18 +965,24 @@ def _write_schedule_sheet(
     no_wrap_center_align = Alignment(horizontal='center', vertical='center', wrap_text=False)
     
     # 顏色 - 全部使用標楷體
-    red_font = Font(name=base_font_name, color='FF0000')
-    second_round_font = Font(name=base_font_name, color='FF0000', bold=True)
-    blue_font = Font(name=base_font_name, color='0000FF')
-    green_font = Font(name=base_font_name, color='008000')
-    gray_font = Font(name=base_font_name, color='A0A0A0')
-    black_font = Font(name=base_font_name, color='000000')
-    normal_font = Font(name=base_font_name)
+    # 放大列印字體，讓單頁預覽更容易閱讀。
+    red_font = Font(name=base_font_name, color='FF0000', size=18)
+    second_round_font = Font(name=base_font_name, color='FF0000', bold=True, size=18)
+    blue_font = Font(name=base_font_name, color='0000FF', size=18)
+    green_font = Font(name=base_font_name, color='008000', size=18)
+    gray_font = Font(name=base_font_name, color='A0A0A0', size=18)
+    black_font = Font(name=base_font_name, color='000000', size=18)
+    normal_font = Font(name=base_font_name, size=18)
     
     # 寫入標題
     ws['A1'] = title
-    ws['A1'].font = Font(name=base_font_name, bold=True, size=14)
-    ws['A1'].alignment = center_align
+    ws['A1'].font = Font(name=base_font_name, bold=True, size=16)
+    ws['A1'].alignment = Alignment(
+        horizontal='center',
+        vertical='center',
+        shrink_to_fit=True,
+    )
+    ws.row_dimensions[1].height = 25
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(columns))
     
     # 寫入表頭
@@ -1182,14 +1191,7 @@ def _write_schedule_sheet(
         cell.font = gray_font if is_other_month_remarks else green_font
         cell.alignment = center_align
 
-        # 補班（專屬欄位，一般補班區域）
-        makeup_text = ''
-
         col_indices = {name: idx for idx, name in enumerate(columns, 1)}
-        makeup_cell = ws.cell(row=row_idx, column=col_indices['補班'], value=makeup_text)
-        makeup_cell.border = border
-        makeup_cell.font = normal_font
-        makeup_cell.alignment = center_align
 
         extra_makeup_lines = {
             '大夜': [],
@@ -1410,17 +1412,34 @@ def _write_schedule_sheet(
     width_by_col = []
     for col_idx, max_len in enumerate(column_widths, 1):
         min_width = min_widths[col_idx - 1] if col_idx - 1 < len(min_widths) else 10
-        # 確保寬度足夠容納兩行文字，加上一些邊距
-        width = max(max_len + 2, min_width) + 5
+        # 確保寬度足夠容納兩行文字，並讓表格列印時更接近滿版。
+        width = (max(max_len + 2, min_width) + 5) * 1.3
         if max_width is not None:
             width = min(width, max_width)
         ws.column_dimensions[get_column_letter(col_idx)].width = width
         width_by_col.append(width)
 
     # 設定所有資料列的列高為兩行的高度（統一大小）
-    two_line_height = 24 * 2  # 兩行的高度
+    two_line_height = 30 * 2
     for row in range(header_row, max_row + 1):
         ws.row_dimensions[row].height = two_line_height
+
+    # 列印版面優化：設定頁面為橫向並在寬度上縮放滿版
+    try:
+        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+    except Exception:
+        ws.page_setup.orientation = 'landscape'
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 1
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    # 減小邊距以便更接近滿版列印
+    try:
+        ws.page_margins.left = 0.35
+        ws.page_margins.right = 0.35
+        ws.page_margins.top = 0.5
+        ws.page_margins.bottom = 0.5
+    except Exception:
+        pass
 
 def read_cross_month_makeup_holidays_from_excel(
     filepath: str,
