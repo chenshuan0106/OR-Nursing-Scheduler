@@ -59,6 +59,14 @@ class NurseInfo:
     # 本月新產生的待補班（因公休跳過，輸出時寫入備註）
     new_pending_makeup: List[Dict] = field(default_factory=list)  # [{'dates': [...], 'shift_type': '大夜'}, ...]
 
+    # 補班欄位中指定日期/班別的補班區塊（例如 "6月補@6/14白班"）
+    manual_makeup_shift_blocks: List[Dict] = field(default_factory=list)
+
+    # 假日待補班通知（跨月假日補班記錄的待處理部分）
+    holiday_pending_notice: List[Dict] = field(default_factory=list)
+    # 上月的假日還班記錄
+    previous_month_holiday_skip_records: List[Dict] = field(default_factory=list)
+
     # 國定假日補償資訊
     holiday_compensations_used: List[datetime] = field(default_factory=list)  # 已使用的國定假日日期
     night_shift_holiday_compensations: List[datetime] = field(default_factory=list)

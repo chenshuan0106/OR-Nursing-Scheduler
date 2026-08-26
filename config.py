@@ -32,12 +32,27 @@ HOLIDAYS_2026 = {
     "12/25": "行憲紀念日"
 }
 
-# 115年對應西元2026年
-YEAR_MAPPING = {
-    115: 2026,
-    116: 2027,
-    114: 2025,
-}
+# 目前作用中的國定假日清單。預設為 HOLIDAYS_2026，
+# 可透過 set_holidays() 覆寫（例如 UI 讓使用者上傳/編輯後套用）。
+_active_holidays = HOLIDAYS_2026
+
+
+def set_holidays(holidays):
+    """設定目前作用中的國定假日清單。
+
+    取代直接改寫 `config.HOLIDAYS_2026` 模組屬性的做法——
+    直接改寫屬性時，任何用 `from config import HOLIDAYS_2026`
+    靜態匯入的地方會抓到覆寫前的舊值，只有用 `config.HOLIDAYS_2026`
+    存取屬性的地方才看得到新值，是容易踩到的陷阱。
+    """
+    global _active_holidays
+    _active_holidays = holidays or {}
+
+
+def get_holidays():
+    """取得目前作用中的國定假日清單。"""
+    return _active_holidays
+
 
 # P1/P2 班型定義
 # P1: 週日(6)、週一(0)、週二(1) 上班

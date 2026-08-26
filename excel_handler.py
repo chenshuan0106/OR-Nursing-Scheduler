@@ -953,7 +953,7 @@ def _write_schedule_sheet(
     
     # 樣式定義 - 使用標楷體
     base_font_name = '標楷體'
-    header_font = Font(name=base_font_name, bold=True, size=13)
+    header_font = Font(name=base_font_name, bold=True, size=19)
     header_fill = PatternFill(start_color='DDDDDD', end_color='DDDDDD', fill_type='solid')
     border = Border(
         left=Side(style='thin'),
@@ -976,7 +976,7 @@ def _write_schedule_sheet(
     
     # 寫入標題
     ws['A1'] = title
-    ws['A1'].font = Font(name=base_font_name, bold=True, size=16)
+    ws['A1'].font = Font(name=base_font_name, bold=True, size=24)
     ws['A1'].alignment = Alignment(
         horizontal='center',
         vertical='center',
@@ -1107,7 +1107,7 @@ def _write_schedule_sheet(
         has_age_55_restriction = False
         if leave_text and ('滿55歲跳大夜' in leave_text or '55歲跳大夜' in leave_text or '55歲以上跳大夜' in leave_text):
             has_age_55_restriction = True
-            purple_font = Font(name='標楷體', color=COLORS['purple'])
+            purple_font = Font(name='標楷體', color=COLORS['purple'], size=18)
         else:
             purple_font = None
         
@@ -1180,7 +1180,7 @@ def _write_schedule_sheet(
                 remarks_parts.append(f"待補班:{date_range}{makeup['shift_type']}")
         
         final_remarks_text = '\n'.join(remarks_parts) if remarks_parts else ''
-        green_font = Font(name='標楷體', color=COLORS['p_shift_green'])
+        green_font = Font(name='標楷體', color=COLORS['p_shift_green'], size=18)
         
         # 判斷是否所有日期都是上個月或下個月
         is_other_month_remarks = _is_all_dates_other_month(final_remarks_text, year, month) if final_remarks_text else False
@@ -1479,6 +1479,7 @@ def read_cross_month_makeup_holidays_from_excel(
     # 找到表頭
     header_row = None
     name_col = None
+    small_night_col = None
     holiday_cols = []
 
     def header_text(value):

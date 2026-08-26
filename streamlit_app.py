@@ -118,7 +118,6 @@ st.markdown("---")
 # 匯入排班邏輯
 try:
     import config
-    from config import HOLIDAYS_2026
     from date_utils import roc_to_western_year
     from excel_handler import get_sheet_names, create_schedule_excel_multi_sheet
     from main import parse_title_year_month, process_sheet, build_pre_schedule_check
@@ -592,6 +591,7 @@ if modules_loaded:
             f"{idx + 1}. {item.get('nurse_name')} ({item.get('source') or '待補班'})": item
             for idx, item in enumerate(entries)
         }
+        sortable_available = False
         try:
             from streamlit_sortables import sort_items
             sortable_signature = hashlib.md5(
@@ -606,29 +606,41 @@ if modules_loaded:
             if sorted_entries != entries:
                 st.session_state[priority_key] = sorted_entries
                 st.rerun()
+            sortable_available = True
             st.caption("拖曳清單項目可調整補班志願序。")
         except Exception:
             st.caption("拖曳排序元件尚未載入；目前可先用上移 / 下移調整順序。")
 
         st.markdown("**目前補班志願序**")
         for idx, item in enumerate(list(st.session_state[priority_key])):
-            row_col1, row_col2, row_col3, row_col4 = st.columns([4, 1, 1, 1])
-            with row_col1:
-                st.write(f"{idx + 1}. {item.get('nurse_name')} / {item.get('source') or '待補班'}")
-            with row_col2:
-                if st.button("上移", key=f"priority_makeup_up_{shift_type}_{sheet_name}_{idx}", disabled=idx == 0, use_container_width=True):
-                    entries[idx - 1], entries[idx] = entries[idx], entries[idx - 1]
-                    st.rerun()
-            with row_col3:
-                if st.button("下移", key=f"priority_makeup_down_{shift_type}_{sheet_name}_{idx}", disabled=idx == len(entries) - 1, use_container_width=True):
-                    entries[idx + 1], entries[idx] = entries[idx], entries[idx + 1]
-                    st.rerun()
-            with row_col4:
-                if st.button("刪除", key=f"priority_makeup_delete_{shift_type}_{sheet_name}_{idx}", use_container_width=True):
-                    removed_item = entries.pop(idx)
-                    if removed_item.get('source_type') == 'detected':
-                        st.session_state[removed_key].append(removed_item.get('id'))
-                    st.rerun()
+            if sortable_available:
+                row_col1, row_col2 = st.columns([5, 1])
+                with row_col1:
+                    st.write(f"{idx + 1}. {item.get('nurse_name')} / {item.get('source') or '待補班'}")
+                with row_col2:
+                    if st.button("刪除", key=f"priority_makeup_delete_{shift_type}_{sheet_name}_{idx}", use_container_width=True):
+                        removed_item = entries.pop(idx)
+                        if removed_item.get('source_type') == 'detected':
+                            st.session_state[removed_key].append(removed_item.get('id'))
+                        st.rerun()
+            else:
+                row_col1, row_col2, row_col3, row_col4 = st.columns([4, 1, 1, 1])
+                with row_col1:
+                    st.write(f"{idx + 1}. {item.get('nurse_name')} / {item.get('source') or '待補班'}")
+                with row_col2:
+                    if st.button("上移", key=f"priority_makeup_up_{shift_type}_{sheet_name}_{idx}", disabled=idx == 0, use_container_width=True):
+                        entries[idx - 1], entries[idx] = entries[idx], entries[idx - 1]
+                        st.rerun()
+                with row_col3:
+                    if st.button("下移", key=f"priority_makeup_down_{shift_type}_{sheet_name}_{idx}", disabled=idx == len(entries) - 1, use_container_width=True):
+                        entries[idx + 1], entries[idx] = entries[idx], entries[idx + 1]
+                        st.rerun()
+                with row_col4:
+                    if st.button("刪除", key=f"priority_makeup_delete_{shift_type}_{sheet_name}_{idx}", use_container_width=True):
+                        removed_item = entries.pop(idx)
+                        if removed_item.get('source_type') == 'detected':
+                            st.session_state[removed_key].append(removed_item.get('id'))
+                        st.rerun()
 
         if st.button(f"清除{shift_type}補班清單", key=f"priority_makeup_clear_{shift_type}_{sheet_name}", use_container_width=True):
             st.session_state[removed_key].extend(
@@ -678,6 +690,7 @@ if modules_loaded:
                 f"{idx + 1}. {item.get('nurse_name')}": item
                 for idx, item in enumerate(entries)
             }
+            sortable_available = False
             try:
                 from streamlit_sortables import sort_items
                 sorted_labels = sort_items(
@@ -689,27 +702,37 @@ if modules_loaded:
                 if sorted_entries != entries:
                     st.session_state[extra_key] = sorted_entries
                     st.rerun()
+                sortable_available = True
                 st.caption("拖曳清單項目可調整額外補班優先順序。")
             except Exception:
                 st.caption("拖曳排序元件尚未載入；目前可先用上移 / 下移調整順序。")
 
             st.markdown("**目前額外補班順序**")
             for idx, item in enumerate(list(st.session_state[extra_key])):
-                row_col1, row_col2, row_col3, row_col4 = st.columns([4, 1, 1, 1])
-                with row_col1:
-                    st.write(f"{idx + 1}. {item.get('nurse_name')}")
-                with row_col2:
-                    if st.button("上移", key=f"extra_makeup_up_{shift_type}_{sheet_name}_{idx}", disabled=idx == 0, use_container_width=True):
-                        entries[idx - 1], entries[idx] = entries[idx], entries[idx - 1]
-                        st.rerun()
-                with row_col3:
-                    if st.button("下移", key=f"extra_makeup_down_{shift_type}_{sheet_name}_{idx}", disabled=idx == len(entries) - 1, use_container_width=True):
-                        entries[idx + 1], entries[idx] = entries[idx], entries[idx + 1]
-                        st.rerun()
-                with row_col4:
-                    if st.button("刪除", key=f"extra_makeup_delete_{shift_type}_{sheet_name}_{idx}", use_container_width=True):
-                        entries.pop(idx)
-                        st.rerun()
+                if sortable_available:
+                    row_col1, row_col2 = st.columns([5, 1])
+                    with row_col1:
+                        st.write(f"{idx + 1}. {item.get('nurse_name')}")
+                    with row_col2:
+                        if st.button("刪除", key=f"extra_makeup_delete_{shift_type}_{sheet_name}_{idx}", use_container_width=True):
+                            entries.pop(idx)
+                            st.rerun()
+                else:
+                    row_col1, row_col2, row_col3, row_col4 = st.columns([4, 1, 1, 1])
+                    with row_col1:
+                        st.write(f"{idx + 1}. {item.get('nurse_name')}")
+                    with row_col2:
+                        if st.button("上移", key=f"extra_makeup_up_{shift_type}_{sheet_name}_{idx}", disabled=idx == 0, use_container_width=True):
+                            entries[idx - 1], entries[idx] = entries[idx], entries[idx - 1]
+                            st.rerun()
+                    with row_col3:
+                        if st.button("下移", key=f"extra_makeup_down_{shift_type}_{sheet_name}_{idx}", disabled=idx == len(entries) - 1, use_container_width=True):
+                            entries[idx + 1], entries[idx] = entries[idx], entries[idx + 1]
+                            st.rerun()
+                    with row_col4:
+                        if st.button("刪除", key=f"extra_makeup_delete_{shift_type}_{sheet_name}_{idx}", use_container_width=True):
+                            entries.pop(idx)
+                            st.rerun()
 
             if st.button(f"清除{shift_type}額外補班", key=f"extra_makeup_clear_{shift_type}_{sheet_name}", use_container_width=True):
                 st.session_state[extra_key] = []
@@ -1027,27 +1050,28 @@ if modules_loaded:
         if not run:
             return
 
-        st.markdown("---")
+        st.divider()
         st.success("✅ 排班完成！")
 
         st.header("📥 下載結果")
-        st.download_button(
-            label=f"下載結果 {run['output_filename']}",
-            data=run['output_bytes'],
-            file_name=run['output_filename'],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            use_container_width=True
-        )
+        with st.container(border=True):
+            st.download_button(
+                label=f"下載結果 {run['output_filename']}",
+                data=run['output_bytes'],
+                file_name=run['output_filename'],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                use_container_width=True
+            )
 
-        show_logs = st.checkbox("顯示詳細 log", value=False, key="show_logs")
-        log_container = st.expander("📝 排班詳細日誌", expanded=show_logs)
-        with log_container:
-            if show_logs:
-                log_text = run.get('log_text', '')
-                st.text(log_text[-5000:] if log_text else '')
-            else:
-                st.caption("勾選「顯示詳細 log」後顯示")
+            show_logs = st.checkbox("顯示詳細 log", value=False, key="show_logs")
+            log_container = st.expander("📝 排班詳細日誌", expanded=show_logs)
+            with log_container:
+                if show_logs:
+                    log_text = run.get('log_text', '')
+                    st.text(log_text[-5000:] if log_text else '')
+                else:
+                    st.caption("勾選「顯示詳細 log」後顯示")
 
     # ========== 側邊欄：國定假日設定 ==========
     with st.sidebar:
@@ -1201,18 +1225,19 @@ if modules_loaded:
 
     # 檔案上傳區
     st.header("📁 上傳值班表")
-    st.markdown("**上傳前請先確認**")
-    st.info(
-        "1. 需要補班的人，請在 Excel 的「補班」欄填「補」或「待補班」即可；不確定日期時不用先寫日期，系統會先找可補的空格。\n\n"
-        "2. 上傳後請看「排班前檢查」，確認大夜、小夜週、假日班的常規起頭人員是否正確；需要時可手動指定起頭。\n\n"
-        "3. 新增人員可直接接在 Excel 名單最下面一列；刪除人員請刪除整列，避免留下空白資料。\n\n"
-        "4. 請先檢查下個月假日班、大P、小P、換心、待命等資訊是否已填好，系統會依這些欄位判斷是否跳過或改補。"
-    )
-    uploaded_file = st.file_uploader(
-        "選擇 Excel 檔案",
-        type=['xlsx', 'xls'],
-        help="請上傳包含護理人員資料的值班表 Excel 檔案"
-    )
+    with st.container(border=True):
+        st.markdown("**上傳前請先確認**")
+        st.info(
+            "1. 需要補班的人，請在 Excel 的「補班」欄填「補」或「待補班」即可；不確定日期時不用先寫日期，系統會先找可補的空格。\n\n"
+            "2. 上傳後請看「排班前檢查」，確認大夜、小夜週、假日班的常規起頭人員是否正確；需要時可手動指定起頭。\n\n"
+            "3. 新增人員可直接接在 Excel 名單最下面一列；刪除人員請刪除整列，避免留下空白資料。\n\n"
+            "4. 請先檢查下個月假日班、大P、小P、換心、待命等資訊是否已填好，系統會依這些欄位判斷是否跳過或改補。"
+        )
+        uploaded_file = st.file_uploader(
+            "選擇 Excel 檔案",
+            type=['xlsx', 'xls'],
+            help="請上傳包含護理人員資料的值班表 Excel 檔案"
+        )
 
     if uploaded_file is not None:
         # 儲存上傳的檔案到臨時位置
@@ -1260,29 +1285,45 @@ if modules_loaded:
                         holiday_metric_text = '無'
 
                 # 顯示檔案資訊
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("📅 民國年", f"{roc_year} 年")
-                with col2:
-                    st.metric("📆 月份", f"{month} 月")
-                with col3:
-                    st.metric("🎌 國定假日", holiday_metric_text)
+                with st.container(border=True):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("📅 民國年", f"{roc_year} 年")
+                    with col2:
+                        st.metric("📆 月份", f"{month} 月")
+                    with col3:
+                        st.metric("🎌 國定假日", holiday_metric_text)
 
-                # 取得頁籤
-                sheet_names = get_sheet_names(tmp_path)
-                st.info(f"📑 找到 {len(sheet_names)} 個頁籤: {', '.join(sheet_names)}")
+                    # 取得頁籤
+                    sheet_names = get_sheet_names(tmp_path)
+                    st.info(f"📑 找到 {len(sheet_names)} 個頁籤: {', '.join(sheet_names)}")
 
-                if holidays_for_year is None:
-                    st.warning(f"⚠️ 尚未設定 {year} 年的國定假日，請在左側新增")
+                    if holidays_for_year is None:
+                        st.warning(f"⚠️ 尚未設定 {year} 年的國定假日，請在左側新增")
 
-                st.markdown("---")
+                st.divider()
+
+                @st.cache_data(show_spinner=False)
+                def _cached_pre_schedule_check(file_bytes, sheet_name, year, month):
+                    # 用檔案內容當快取鍵：同一份檔案在使用者操作其他元件、
+                    # 觸發 Streamlit 整頁重跑時，不用每次都重新解析 Excel。
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as cache_file:
+                        cache_file.write(file_bytes)
+                        cache_tmp_path = cache_file.name
+                    try:
+                        return build_pre_schedule_check(cache_tmp_path, sheet_name, year, month)
+                    finally:
+                        try:
+                            os.unlink(cache_tmp_path)
+                        except Exception:
+                            pass
 
                 pre_schedule_checks = {}
                 with st.spinner("正在建立排班前檢查..."):
                     for sheet_name in sheet_names:
                         try:
-                            pre_schedule_checks[sheet_name] = build_pre_schedule_check(
-                                tmp_path,
+                            pre_schedule_checks[sheet_name] = _cached_pre_schedule_check(
+                                uploaded_file.getvalue(),
                                 sheet_name,
                                 year,
                                 month,
@@ -1293,17 +1334,17 @@ if modules_loaded:
                 if pre_schedule_checks:
                     render_pre_schedule_checks(pre_schedule_checks)
 
-                st.markdown("---")
+                st.divider()
 
                 # 排班按鈕
                 if st.button("🚀 開始排班", type="primary", use_container_width=True):
 
-                    # 🔴 關鍵：動態更新 config 模組的假日設定
+                    # 🔴 關鍵：套用使用者設定的假日清單為目前作用中的假日表
                     year_str = str(year)
                     if year_str in st.session_state.all_holidays:
-                        config.HOLIDAYS_2026 = st.session_state.all_holidays[year_str]
+                        config.set_holidays(st.session_state.all_holidays[year_str])
                     else:
-                        config.HOLIDAYS_2026 = {}
+                        config.set_holidays({})
                         st.warning("⚠️ 使用空的國定假日設定")
 
                     # 建立進度條和狀態

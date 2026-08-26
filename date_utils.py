@@ -4,8 +4,23 @@
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional
 import calendar
+import logging
 import re
 import config
+
+logger = logging.getLogger(__name__)
+
+_DATE_SHAPE_RE = re.compile(r'\d{1,2}/\d{1,2}')
+
+
+def _looks_like_date_attempt(text: str) -> bool:
+    """判斷文字是否含有 M/D 形狀的片段。
+
+    用來過濾掉像 '8月換心'、'*滿55歲跳大夜' 這類本來就不是日期、
+    只是被丟進日期解析函式裡的狀態註記文字，避免把「本來就不該
+    被當成日期」的正常內容也記成解析失敗警告。
+    """
+    return bool(text) and bool(_DATE_SHAPE_RE.search(text))
 
 
 def roc_to_western_year(roc_year: int) -> int:
@@ -27,7 +42,9 @@ def parse_date_string(date_str: str, default_year: int = 2026) -> Optional[datet
         return None
     
     date_str = date_str.strip()
-    
+    if not date_str:
+        return None
+
     # 嘗試解析 M/D 格式
     try:
         parts = date_str.split('/')
@@ -37,7 +54,9 @@ def parse_date_string(date_str: str, default_year: int = 2026) -> Optional[datet
             return datetime(default_year, month, day)
     except (ValueError, IndexError):
         pass
-    
+
+    if _looks_like_date_attempt(date_str):
+        logger.warning("parse_date_string: 無法解析日期字串 %r", date_str)
     return None
 
 
@@ -50,26 +69,30 @@ def parse_date_range(range_str: str, default_year: int = 2026) -> List[datetime]
         return []
     
     range_str = range_str.strip()
-    
+    if not range_str:
+        return []
+
     # 檢查是否包含範圍符號
     if '-' in range_str:
         parts = range_str.split('-')
         if len(parts) == 2:
             start_date = parse_date_string(parts[0], default_year)
             end_date = parse_date_string(parts[1], default_year)
-            
+
             if start_date and end_date:
                 # 處理跨年的情況
                 if end_date < start_date:
                     end_date = end_date.replace(year=end_date.year + 1)
-                
+
                 dates = []
                 current = start_date
                 while current <= end_date:
                     dates.append(current)
                     current += timedelta(days=1)
                 return dates
-    
+
+    if _looks_like_date_attempt(range_str):
+        logger.warning("parse_date_range: 無法解析日期範圍 %r", range_str)
     return []
 
 
@@ -94,12 +117,25 @@ def parse_dot_separated_dates(date_str: str, default_year: int = 2026) -> List[d
             while current <= end_date:
                 dates.append(current)
                 current += timedelta(days=1)
+        else:
+            logger.warning(
+                "parse_dot_separated_dates: 區間片段無法解析 %r-%r（原始文字 %r）",
+                start_str, end_str, date_str,
+            )
 
     parts = date_str.split('.')
     for part in parts:
-        date = parse_date_string(part.strip(), default_year)
+        stripped = part.strip()
+        date = parse_date_string(stripped, default_year)
         if date:
             dates.append(date)
+        elif stripped and '-' not in stripped and _looks_like_date_attempt(stripped):
+            # 含 '-' 的片段可能已被上面的區間規則處理過，避免重複告警；
+            # 不含 '/' 的片段（例如狀態註記文字）本來就不是日期，不用告警
+            logger.warning(
+                "parse_dot_separated_dates: 片段無法解析 %r（原始文字 %r）",
+                stripped, date_str,
+            )
 
     if not dates:
         return dates
@@ -131,13 +167,13 @@ def is_saturday(date: datetime) -> bool:
 def is_holiday(date: datetime) -> bool:
     """判斷是否為國定假日"""
     date_key = f"{date.month}/{date.day}"
-    return date_key in config.HOLIDAYS_2026
+    return date_key in config.get_holidays()
 
 
 def get_holiday_name(date: datetime) -> Optional[str]:
     """取得國定假日名稱"""
     date_key = f"{date.month}/{date.day}"
-    return config.HOLIDAYS_2026.get(date_key)
+    return config.get_holidays().get(date_key)
 
 
 def get_month_dates(year: int, month: int) -> List[datetime]:
@@ -278,8 +314,9 @@ def get_p_shift_dates_for_month(
     取得指定月份的 P1/P2/換心 班的上班日期
     """
     from config import SHIFT_PATTERNS
-    
+
     if shift_type not in SHIFT_PATTERNS:
+        logger.warning("get_p_shift_dates_for_month: 未知的班別類型 %r", shift_type)
         return []
     
     pattern = SHIFT_PATTERNS[shift_type]

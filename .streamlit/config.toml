@@ -1,0 +1,27 @@
+[theme]
+# 方向 A「臨床精簡」：冷灰藍底 + 鋼藍強調色，邊框收斂、圓角較小，
+# 標題不換字體、靠字重和留白拉開層次，偏精確俐落的感覺。
+
+primaryColor = "#2C5F7C"
+backgroundColor = "#F6F7F9"
+secondaryBackgroundColor = "#EDF0F3"
+textColor = "#1C2430"
+borderColor = "#DFE3E8"
+baseRadius = "0.4rem"
+
+font = "Noto Sans TC:https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap"
+headingFontWeights = [900, 700, 700, 600, 600, 600]
+
+# 全站字級不小於 18px。baseFontSize 是 rem 的基準（原本 16px），
+# 標題和 code 字級預設是用 rem 定義，但主內容跟側邊欄的預設 rem
+# 倍率不一樣，兩邊都要各自明確設定，才能保證側邊欄的小標題也不會
+# 低於 18px。
+baseFontSize = 18
+headingFontSizes = ["2.75rem", "2.25rem", "2rem", "1.75rem", "1.5rem", "1.25rem"]
+codeFontSize = "1.1rem"
+
+[theme.sidebar]
+backgroundColor = "#EDF0F3"
+borderColor = "#DFE3E8"
+headingFontSizes = ["1.75rem", "1.5rem", "1.4rem", "1.3rem", "1.2rem", "1.15rem"]
+codeFontSize = "1.1rem"

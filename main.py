@@ -62,6 +62,23 @@ def parse_title_year_month(filepath: str) -> Tuple[Optional[int], Optional[int]]
     return None, None
 
 
+def _load_nurses(filepath: str, sheet_name: str, year: int) -> List[NurseInfo]:
+    """讀取並解析 Excel 頁籤中的護理人員資料。
+
+    注意：build_pre_schedule_check 和 process_sheet 各自呼叫本函式，
+    會各自產生一份獨立的 NurseInfo 物件——這是既有行為，
+    build_pre_schedule_check 產生的物件僅供排班前核對顯示用，
+    不會影響 process_sheet 實際排班的結果。
+    """
+    nurses_data = read_nurses_from_excel(filepath, sheet_name)
+    nurses = []
+    for row_data in nurses_data:
+        nurse = parse_nurse_info_from_row(row_data, row_data.get('_row_index', 0), year)
+        if nurse:
+            nurses.append(nurse)
+    return nurses
+
+
 def find_last_assigned_index(nurses: List[NurseInfo], last_assigned_name: str) -> int:
     """找到上個月最後排班的人在列表中的索引"""
     if not last_assigned_name:
@@ -229,13 +246,7 @@ def build_pre_schedule_check(
     這份資料會保留「欲排班月份」讀到的人名順序，並標出系統從上個月
     Excel 欄位抓到的大夜、小夜週、假日班定位點，方便排班前確認格子和順序。
     """
-    nurses_data = read_nurses_from_excel(filepath, sheet_name)
-
-    nurses = []
-    for row_data in nurses_data:
-        nurse = parse_nurse_info_from_row(row_data, row_data.get('_row_index', 0), year)
-        if nurse:
-            nurses.append(nurse)
+    nurses = _load_nurses(filepath, sheet_name, year)
 
     nurse_names = [nurse.name for nurse in nurses]
     last_night = find_last_assigned_from_excel(filepath, sheet_name, month, year, nurse_names)
@@ -655,42 +666,18 @@ def _schedule_extra_makeup_entries(
     return results
 
 
-def process_sheet(
+def _prepare_nurses_for_scheduling(
     filepath: str,
     sheet_name: str,
     year: int,
     month: int,
-    last_assigned_night_name: str = None,
-    last_assigned_small_night_name: str = None,
-    last_assigned_holiday_name: str = None,
-    regular_start_night_name: str = None,
-    regular_start_small_night_name: str = None,
-    regular_start_holiday_name: str = None,
-    manual_shift_entries: Optional[List[Dict[str, Any]]] = None,
-    priority_makeup_entries: Optional[List[Dict[str, Any]]] = None,
-    extra_makeup_entries: Optional[List[Dict[str, Any]]] = None,
-    manual_makeup_note: str = '',
-    return_skip_names: Optional[List[str]] = None,
-) -> Tuple[List[NurseInfo], List[Dict], List[Dict], List, List[Dict], str, str, str, set, set]:
-    """
-    處理單一頁籤的排班
-
-    Returns:
-        (nurses, night_shift_results, small_night_shift_results, holiday_shift_results,
-         night_last_normal_name, small_night_last_normal_name, holiday_last_normal_name)
-    """
-    print(f"\n--- 處理頁籤: {sheet_name} ---")
-    if manual_makeup_note:
-        print(f"補班說明: {manual_makeup_note}")
-
-    nurses_data = read_nurses_from_excel(filepath, sheet_name)
-
-    # 解析護理人員資訊
-    nurses = []
-    for row_data in nurses_data:
-        nurse = parse_nurse_info_from_row(row_data, row_data.get('_row_index', 0), year)
-        if nurse:
-            nurses.append(nurse)
+    return_skip_names: Optional[List[str]],
+    manual_shift_entries: Optional[List[Dict[str, Any]]],
+    priority_makeup_entries: Optional[List[Dict[str, Any]]],
+) -> List[NurseInfo]:
+    """讀取護理人員並套用排班前的各項準備（還班標記、手動欠班、
+    國假補償整理、跨月補班記錄、優先補班）。"""
+    nurses = _load_nurses(filepath, sheet_name, year)
 
     # 如果傳入 UI 標記的還班名單，套用到對應的護理人員（以月份 key 存放）
     if return_skip_names:
@@ -731,7 +718,7 @@ def process_sheet(
     print("讀取跨月補班記錄...")
     from excel_handler import read_cross_month_makeup_holidays_from_excel
     cross_month_makeups = read_cross_month_makeup_holidays_from_excel(filepath, sheet_name, month, year)
-    
+
     # 填充到每個護理人員
     # cross_month_makeups 的每筆記錄有 type: 'fixed' 或 'pending'
     for nurse in nurses:
@@ -753,19 +740,22 @@ def process_sheet(
 
     _apply_priority_makeup_entries(nurses, priority_makeup_entries, month)
 
-    # 如果沒有護理人員，直接返回空結果
-    if not nurses:
-        print(f"  頁籤 {sheet_name} 沒有護理人員資料，跳過")
-        return [], [], [], [], [], '', '', '', set(), set()
+    return nurses
 
-    # 初始化結果容器
-    all_extra_makeup_results = []
 
-    # ===========================
-    # 大夜班流程：額外補班 → 補班 → 定位點輪續
-    # ===========================
+def _schedule_night_block(
+    nurses: List[NurseInfo],
+    filepath: str,
+    sheet_name: str,
+    year: int,
+    month: int,
+    last_assigned_night_name: Optional[str],
+    regular_start_night_name: Optional[str],
+    extra_makeup_entries: Optional[List[Dict[str, Any]]],
+):
+    """大夜班流程：額外補班 → 補班 → 定位點輪續。"""
     print("\n========== 大夜班排班流程 ==========")
-    
+
     # 1. 大夜班額外補班
     print("開始大夜班額外補班...")
     night_extra_makeup_results = _schedule_extra_makeup_entries(
@@ -777,8 +767,7 @@ def process_sheet(
         scheduled_small_night_results=[],
         target_shift_type='大夜',
     )
-    all_extra_makeup_results.extend(night_extra_makeup_results)
-    
+
     # 2. 大夜班定位點輪續（包含補班，補班已在 _apply_priority_makeup_entries 中標記）
     if not last_assigned_night_name:
         last_assigned_night_name = find_last_assigned_from_excel(filepath, sheet_name, month, year)
@@ -803,11 +792,23 @@ def process_sheet(
     )
     print_night_shift_preview(night_results, month, sheet_name)
 
-    # ===========================
-    # 小夜班流程：額外補班 → 補班 → 定位點輪續
-    # ===========================
+    return night_results, night_last_normal_name, night_identity_skipped, night_extra_makeup_results
+
+
+def _schedule_small_night_block(
+    nurses: List[NurseInfo],
+    filepath: str,
+    sheet_name: str,
+    year: int,
+    month: int,
+    last_assigned_small_night_name: Optional[str],
+    regular_start_small_night_name: Optional[str],
+    extra_makeup_entries: Optional[List[Dict[str, Any]]],
+    night_results: List[Dict],
+):
+    """小夜班流程：額外補班 → 補班 → 定位點輪續。"""
     print("\n========== 小夜班排班流程 ==========")
-    
+
     # 1. 小夜班額外補班
     print("開始小夜班額外補班...")
     small_night_extra_makeup_results = _schedule_extra_makeup_entries(
@@ -819,8 +820,7 @@ def process_sheet(
         scheduled_small_night_results=[],
         target_shift_type='小夜週',
     )
-    all_extra_makeup_results.extend(small_night_extra_makeup_results)
-    
+
     # 2. 小夜班定位點輪續（包含補班）
     if not last_assigned_small_night_name:
         last_assigned_small_night_name = find_last_assigned_small_night_from_excel(filepath, sheet_name, month, year)
@@ -845,14 +845,25 @@ def process_sheet(
     )
     print_small_night_shift_preview(small_night_results, month, sheet_name)
 
-    # ===========================
-    # 假日班流程：額外補班 → 補班 → 定位點輪續
-    # ===========================
+    return small_night_results, small_night_last_normal_name, small_night_identity_skipped, small_night_extra_makeup_results
+
+
+def _schedule_holiday_block(
+    nurses: List[NurseInfo],
+    filepath: str,
+    sheet_name: str,
+    year: int,
+    month: int,
+    last_assigned_holiday_name: Optional[str],
+    regular_start_holiday_name: Optional[str],
+    extra_makeup_entries: Optional[List[Dict[str, Any]]],
+):
+    """假日班流程：額外補班 → 補班 → 定位點輪續。"""
     print("\n========== 假日班排班流程 ==========")
-    
+
     # 1. 假日班額外補班
     print("開始假日班額外補班...")
-    
+
     # 2. 假日班定位點輪續（包含補班）
     if not last_assigned_holiday_name:
         last_assigned_holiday_name = find_last_assigned_holiday_from_excel(filepath, sheet_name, month, year)
@@ -889,8 +900,69 @@ def process_sheet(
         else:
             regular_holiday_results.append(result)
     holiday_results = regular_holiday_results
-    all_extra_makeup_results.extend(holiday_extra_makeup_results)
     print_holiday_shift_preview(holiday_results, month, sheet_name)
+
+    return holiday_results, holiday_last_normal_name, holiday_extra_makeup_results
+
+
+def process_sheet(
+    filepath: str,
+    sheet_name: str,
+    year: int,
+    month: int,
+    last_assigned_night_name: str = None,
+    last_assigned_small_night_name: str = None,
+    last_assigned_holiday_name: str = None,
+    regular_start_night_name: str = None,
+    regular_start_small_night_name: str = None,
+    regular_start_holiday_name: str = None,
+    manual_shift_entries: Optional[List[Dict[str, Any]]] = None,
+    priority_makeup_entries: Optional[List[Dict[str, Any]]] = None,
+    extra_makeup_entries: Optional[List[Dict[str, Any]]] = None,
+    manual_makeup_note: str = '',
+    return_skip_names: Optional[List[str]] = None,
+) -> Tuple[List[NurseInfo], List[Dict], List[Dict], List, List[Dict], str, str, str, set, set]:
+    """
+    處理單一頁籤的排班
+
+    Returns:
+        (nurses, night_shift_results, small_night_shift_results, holiday_shift_results,
+         night_last_normal_name, small_night_last_normal_name, holiday_last_normal_name)
+    """
+    print(f"\n--- 處理頁籤: {sheet_name} ---")
+    if manual_makeup_note:
+        print(f"補班說明: {manual_makeup_note}")
+
+    nurses = _prepare_nurses_for_scheduling(
+        filepath, sheet_name, year, month,
+        return_skip_names, manual_shift_entries, priority_makeup_entries,
+    )
+
+    # 如果沒有護理人員，直接返回空結果
+    if not nurses:
+        print(f"  頁籤 {sheet_name} 沒有護理人員資料，跳過")
+        return [], [], [], [], [], '', '', '', set(), set()
+
+    all_extra_makeup_results = []
+
+    night_results, night_last_normal_name, night_identity_skipped, night_extra_makeup_results = _schedule_night_block(
+        nurses, filepath, sheet_name, year, month,
+        last_assigned_night_name, regular_start_night_name, extra_makeup_entries,
+    )
+    all_extra_makeup_results.extend(night_extra_makeup_results)
+
+    small_night_results, small_night_last_normal_name, small_night_identity_skipped, small_night_extra_makeup_results = _schedule_small_night_block(
+        nurses, filepath, sheet_name, year, month,
+        last_assigned_small_night_name, regular_start_small_night_name, extra_makeup_entries,
+        night_results,
+    )
+    all_extra_makeup_results.extend(small_night_extra_makeup_results)
+
+    holiday_results, holiday_last_normal_name, holiday_extra_makeup_results = _schedule_holiday_block(
+        nurses, filepath, sheet_name, year, month,
+        last_assigned_holiday_name, regular_start_holiday_name, extra_makeup_entries,
+    )
+    all_extra_makeup_results.extend(holiday_extra_makeup_results)
 
     return (
         nurses,
@@ -940,7 +1012,7 @@ def main():
 
     print(f"護理排班系統")
     print(f"目標月份: 民國 {roc_year} 年 {month} 月 (西元 {year} 年)")
-    print(f"國定假日數量: {len(config.HOLIDAYS_2026)} 天")
+    print(f"國定假日數量: {len(config.get_holidays())} 天")
     print(f"\n讀取檔案: {input_file}")
 
     # 取得所有頁籤
