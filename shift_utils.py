@@ -3,12 +3,9 @@
 """
 from typing import List, Dict, Tuple, Any, Optional
 from datetime import datetime, timedelta
-import logging
 import re
 
 from models import NurseInfo
-
-logger = logging.getLogger(__name__)
 from date_utils import (
     parse_date_string,
     parse_dot_separated_dates,
@@ -35,11 +32,6 @@ def extract_parenthesized_dates(text: str, default_year: int = 2026) -> Tuple[Li
             dt = parse_date_string(date_str, default_year)
             if dt:
                 extracted.append(dt)
-            else:
-                logger.warning(
-                    "extract_parenthesized_dates: 括號內日期無法解析 %r（原始文字 %r）",
-                    date_str, text,
-                )
         return ''
 
     cleaned = re.sub(r'\(([^)]*)\)', _replace, text)
@@ -214,17 +206,12 @@ def extract_date_ranges(text: str, default_year: int = 2026) -> List[datetime]:
             # 處理跨年的情況
             if end_date < start_date:
                 end_date = end_date.replace(year=end_date.year + 1)
-
+            
             current = start_date
             while current <= end_date:
                 all_dates.append(current)
                 current += timedelta(days=1)
-        else:
-            logger.warning(
-                "extract_date_ranges: 範圍片段無法解析 %r-%r（原始文字 %r）",
-                start_str, end_str, text,
-            )
-
+    
     return all_dates
 
 
@@ -270,10 +257,6 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
     original_name = str(name_value).strip()
     name = original_name.lstrip('*').strip()
     if not name:
-        logger.warning(
-            "parse_nurse_info_from_row: 第 %s 列姓名欄位去除符號後為空 %r，該列被忽略",
-            row_index, name_value,
-        )
         return None
 
     nurse = NurseInfo(

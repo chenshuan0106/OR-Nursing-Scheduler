@@ -383,10 +383,15 @@ def create_schedule_excel_multi_sheet(
     all_results: Dict[str, Dict],
     year: int,
     month: int,
-):
+) -> List[Dict[str, Any]]:
     """
     建立多頁籤的排班結果 Excel
-    
+
+    Returns:
+        holiday_overflow: 所有頁籤中，因為超過假日欄位版型上限（4欄）而未寫入
+        Excel 的紀錄清單，每筆為 {'sheet_name', 'nurse_name', 'column_needed', 'display_text'}。
+        呼叫端應該把這個清單清楚顯示給使用者，不能悄悄忽略。
+
     all_results 格式:
     {
         '頁籤名': {
@@ -413,12 +418,13 @@ def create_schedule_excel_multi_sheet(
     }
 
     first_sheet = True
+    all_holiday_overflow: List[Dict[str, Any]] = []
 
     if pre_schedule_checks:
         default_sheet.title = '排班前核對'
         _write_pre_schedule_check_sheet(default_sheet, title, pre_schedule_checks, year, month)
         first_sheet = False
-    
+
     for sheet_name, results in all_results.items():
         output_sheet_name = _format_output_sheet_name(sheet_name, year, month)
         if first_sheet:
@@ -427,12 +433,15 @@ def create_schedule_excel_multi_sheet(
             first_sheet = False
         else:
             ws = wb.create_sheet(title=output_sheet_name)
-        
-        _write_schedule_sheet(
+
+        sheet_overflow = _write_schedule_sheet(
             ws, title, results, year, month, sheet_name
         )
-    
+        if sheet_overflow:
+            all_holiday_overflow.extend(sheet_overflow)
+
     wb.save(output_path)
+    return all_holiday_overflow
 
 
 def _format_output_sheet_name(sheet_name: str, year: int, month: int) -> str:
@@ -465,9 +474,9 @@ def _write_pre_schedule_check_sheet(
     base_font_name = '標楷體'
     header_font = Font(name=base_font_name, bold=True)
     title_font = Font(name=base_font_name, bold=True, size=14)
-    normal_font = Font(name=base_font_name, size=11)
-    marker_font = Font(name=base_font_name, bold=True, color='FF0000', size=11)
-    warning_font = Font(name=base_font_name, color='FF0000', size=11)
+    normal_font = Font(name=base_font_name)
+    marker_font = Font(name=base_font_name, bold=True, color='FF0000')
+    warning_font = Font(name=base_font_name, color='FF0000')
     header_fill = PatternFill(start_color='DDDDDD', end_color='DDDDDD', fill_type='solid')
     section_fill = PatternFill(start_color='EAF2F8', end_color='EAF2F8', fill_type='solid')
     marker_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
@@ -499,12 +508,7 @@ def _write_pre_schedule_check_sheet(
     max_col = max(len(detail_columns), len(summary_columns))
     ws['A1'] = f'{title} - 排班前核對'
     ws['A1'].font = title_font
-    ws['A1'].alignment = Alignment(
-        horizontal='center',
-        vertical='center',
-        shrink_to_fit=True,
-    )
-    ws.row_dimensions[1].height = 28
+    ws['A1'].alignment = center_align
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
 
     ws['A2'] = f'目標月份：{year}年{month}月'
@@ -911,9 +915,14 @@ def _write_schedule_sheet(
     year: int,
     month: int,
     sheet_name: str,
-):
+) -> List[Dict[str, Any]]:
     """
     寫入單一頁籤的排班結果
+
+    Returns:
+        holiday_overflow: 因為超過假日欄位版型上限（4欄）而沒有寫入 Excel 的紀錄，
+        每筆為 {'sheet_name', 'nurse_name', 'column_needed', 'display_text'}。
+        排班核心結果本身不受影響，只是這裡沒有實體欄位可以顯示。
     """
     nurses = results.get('nurses', [])
     night_results = results.get('night_results', [])
@@ -924,7 +933,7 @@ def _write_schedule_sheet(
     small_night_identity_skipped = results.get('small_night_identity_skipped', set())
     
     # 只有當該類別有額外補班時才顯示對應欄位；順序為：
-    # 大夜額外補班 → 大夜 → 小夜額外補班 → 小夜週 → 假日額外補班 → 假日(4 欄)
+    # 大夜額外補班 → 大夜 → 小夜額外補班 → 小夜週 → 假日額外補班 → 假日(4 欄) → 補班
     has_night_extra = any(r.get('shift_type') == '大夜' for r in extra_makeup_results)
     has_small_extra = any(r.get('shift_type') == '小夜週' for r in extra_makeup_results)
     has_holiday_extra = any(r.get('shift_type') == '假日班' for r in extra_makeup_results)
@@ -950,10 +959,12 @@ def _write_schedule_sheet(
     for i in range(1, 5):
         columns.append(f'假日{i}')
         display_headers.append('假日')
+    columns.append('補班')
+    display_headers.append('補班')
     
     # 樣式定義 - 使用標楷體
     base_font_name = '標楷體'
-    header_font = Font(name=base_font_name, bold=True, size=19)
+    header_font = Font(name=base_font_name, bold=True)
     header_fill = PatternFill(start_color='DDDDDD', end_color='DDDDDD', fill_type='solid')
     border = Border(
         left=Side(style='thin'),
@@ -965,24 +976,18 @@ def _write_schedule_sheet(
     no_wrap_center_align = Alignment(horizontal='center', vertical='center', wrap_text=False)
     
     # 顏色 - 全部使用標楷體
-    # 放大列印字體，讓單頁預覽更容易閱讀。
-    red_font = Font(name=base_font_name, color='FF0000', size=18)
-    second_round_font = Font(name=base_font_name, color='FF0000', bold=True, size=18)
-    blue_font = Font(name=base_font_name, color='0000FF', size=18)
-    green_font = Font(name=base_font_name, color='008000', size=18)
-    gray_font = Font(name=base_font_name, color='A0A0A0', size=18)
-    black_font = Font(name=base_font_name, color='000000', size=18)
-    normal_font = Font(name=base_font_name, size=18)
+    red_font = Font(name=base_font_name, color='FF0000')
+    second_round_font = Font(name=base_font_name, color='FF0000', bold=True)
+    blue_font = Font(name=base_font_name, color='0000FF')
+    green_font = Font(name=base_font_name, color='008000')
+    gray_font = Font(name=base_font_name, color='A0A0A0')
+    black_font = Font(name=base_font_name, color='000000')
+    normal_font = Font(name=base_font_name)
     
     # 寫入標題
     ws['A1'] = title
-    ws['A1'].font = Font(name=base_font_name, bold=True, size=24)
-    ws['A1'].alignment = Alignment(
-        horizontal='center',
-        vertical='center',
-        shrink_to_fit=True,
-    )
-    ws.row_dimensions[1].height = 25
+    ws['A1'].font = Font(name=base_font_name, bold=True, size=14)
+    ws['A1'].alignment = center_align
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(columns))
     
     # 寫入表頭
@@ -1017,6 +1022,7 @@ def _write_schedule_sheet(
         nurse_extra_makeup_results[name].append(result)
 
     holiday_assignments = {}
+    holiday_overflow: List[Dict[str, Any]] = []
 
     if holiday_results and nurses:
         for result in holiday_results:
@@ -1026,7 +1032,18 @@ def _write_schedule_sheet(
             if col_num < 1:
                 col_num = 1
             if col_num > 4:
-                col_num = 4
+                # 目前版型只有 4 個假日欄。不要壓回 col4（會撞掉別筆紀錄、
+                # 靜默遺失資料）——這筆記錄核心結果仍然完整保留在 holiday_results，
+                # 只是這次沒有實體欄位可以寫進 Excel，明確記下來回報給使用者。
+                from holiday_shift import format_holiday_shift_result
+                holiday_overflow.append({
+                    'sheet_name': sheet_name,
+                    'nurse_name': name,
+                    'column_needed': col_num,
+                    'display_text': format_holiday_shift_result(result, month).replace('\n', ' '),
+                })
+                print(f"  警告: {sheet_name} / {name} 需要第{col_num}個假日欄位，目前版型僅支援4欄，未寫入 Excel")
+                continue
             key = (name, col_num)
             existing = holiday_assignments.get(key)
             if not existing:
@@ -1107,7 +1124,7 @@ def _write_schedule_sheet(
         has_age_55_restriction = False
         if leave_text and ('滿55歲跳大夜' in leave_text or '55歲跳大夜' in leave_text or '55歲以上跳大夜' in leave_text):
             has_age_55_restriction = True
-            purple_font = Font(name='標楷體', color=COLORS['purple'], size=18)
+            purple_font = Font(name='標楷體', color=COLORS['purple'])
         else:
             purple_font = None
         
@@ -1180,7 +1197,7 @@ def _write_schedule_sheet(
                 remarks_parts.append(f"待補班:{date_range}{makeup['shift_type']}")
         
         final_remarks_text = '\n'.join(remarks_parts) if remarks_parts else ''
-        green_font = Font(name='標楷體', color=COLORS['p_shift_green'], size=18)
+        green_font = Font(name='標楷體', color=COLORS['p_shift_green'])
         
         # 判斷是否所有日期都是上個月或下個月
         is_other_month_remarks = _is_all_dates_other_month(final_remarks_text, year, month) if final_remarks_text else False
@@ -1191,7 +1208,14 @@ def _write_schedule_sheet(
         cell.font = gray_font if is_other_month_remarks else green_font
         cell.alignment = center_align
 
+        # 補班（專屬欄位，一般補班區域）
+        makeup_text = ''
+
         col_indices = {name: idx for idx, name in enumerate(columns, 1)}
+        makeup_cell = ws.cell(row=row_idx, column=col_indices['補班'], value=makeup_text)
+        makeup_cell.border = border
+        makeup_cell.font = normal_font
+        makeup_cell.alignment = center_align
 
         extra_makeup_lines = {
             '大夜': [],
@@ -1412,34 +1436,103 @@ def _write_schedule_sheet(
     width_by_col = []
     for col_idx, max_len in enumerate(column_widths, 1):
         min_width = min_widths[col_idx - 1] if col_idx - 1 < len(min_widths) else 10
-        # 確保寬度足夠容納兩行文字，並讓表格列印時更接近滿版。
-        width = (max(max_len + 2, min_width) + 5) * 1.3
+        # 確保寬度足夠容納兩行文字，加上一些邊距
+        width = max(max_len + 2, min_width) + 5
         if max_width is not None:
             width = min(width, max_width)
         ws.column_dimensions[get_column_letter(col_idx)].width = width
         width_by_col.append(width)
 
     # 設定所有資料列的列高為兩行的高度（統一大小）
-    two_line_height = 30 * 2
+    two_line_height = 24 * 2  # 兩行的高度
     for row in range(header_row, max_row + 1):
         ws.row_dimensions[row].height = two_line_height
 
-    # 列印版面優化：設定頁面為橫向並在寬度上縮放滿版
-    try:
-        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
-    except Exception:
-        ws.page_setup.orientation = 'landscape'
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 1
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
-    # 減小邊距以便更接近滿版列印
-    try:
-        ws.page_margins.left = 0.35
-        ws.page_margins.right = 0.35
-        ws.page_margins.top = 0.5
-        ws.page_margins.bottom = 0.5
-    except Exception:
-        pass
+    return holiday_overflow
+
+
+def find_already_consumed_compensation_dates_from_excel(
+    filepath: str,
+    sheet_name: str,
+    target_year: int,
+) -> Dict[str, List[datetime]]:
+    """
+    從 Excel 假日班欄位掃描「補X/X」「捕X/X」（補償已使用）記錄，
+    找出每個人「已經用掉」的國定假日補償日期，避免同一筆補償被結轉到本月重複使用。
+
+    例如上個月的假日欄若寫「捕10/9(原10/17白班)」，代表 10/9 的補償
+    已經在上個月用掉了，10/9 不應該再被當成本月可用的補償結轉。
+
+    Returns:
+        {nurse_name: [已使用的補償日期, ...]}
+    """
+    wb = load_workbook(filepath, data_only=True)
+    ws = wb[sheet_name]
+
+    header_row = None
+    name_col = None
+    small_night_col = None
+    holiday_cols = []
+
+    def header_text(value):
+        return re.sub(r'\s+', '', str(value or ''))
+
+    for row_idx in range(1, 10):
+        row_values = [cell.value for cell in ws[row_idx]]
+        normalized_row_values = [header_text(value) for value in row_values]
+        if '主值' in normalized_row_values or '副值' in normalized_row_values:
+            header_row = row_idx
+            for col_idx, value in enumerate(row_values, 1):
+                normalized_value = header_text(value)
+                if normalized_value == '主值' or normalized_value == '副值':
+                    name_col = col_idx
+                elif normalized_value == '小夜週':
+                    small_night_col = col_idx
+                elif '假日' in normalized_value:
+                    holiday_cols.append(col_idx)
+            break
+
+    if header_row and not holiday_cols and small_night_col:
+        holiday_cols = list(range(small_night_col + 1, ws.max_column + 1))
+
+    if not header_row or not name_col or not holiday_cols:
+        wb.close()
+        return {}
+
+    consumed: Dict[str, List[datetime]] = {}
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        name_cell = ws.cell(row=row_idx, column=name_col).value
+        if not name_cell:
+            continue
+        name = str(name_cell).lstrip('*').strip()
+        if not name:
+            continue
+
+        for col_idx in holiday_cols:
+            cell_value = ws.cell(row=row_idx, column=col_idx).value
+            if not cell_value:
+                continue
+            text = str(cell_value).strip()
+            match = re.match(r'^[補捕]\s*(\d{1,2})/(\d{1,2})', text)
+            if not match:
+                continue
+            # 「補X/X(N月補跳值班)」是「預告下個月要用這筆補償跳過一次」，
+            # 這筆補償當下還沒真正用掉；只有「(原X/X班)」這種格式才代表
+            # 補償已經在本欄位對應的月份實際用掉、抵掉了某個原本排定的班。
+            # 不能把「預告」誤判成「已消耗」，否則會把還沒用的補償提前清除。
+            if re.search(r'\d+月補跳值班', text) or (re.search(r'\d+月補', text) and '原' not in text):
+                continue
+            month_num, day_num = int(match.group(1)), int(match.group(2))
+            try:
+                date = datetime(target_year, month_num, day_num)
+            except ValueError:
+                continue
+            consumed.setdefault(name, []).append(date)
+            print(f"  {name} 已在上月用掉補償 {month_num}/{day_num}（{text.splitlines()[0]}）")
+
+    wb.close()
+    return consumed
+
 
 def read_cross_month_makeup_holidays_from_excel(
     filepath: str,
@@ -1479,7 +1572,6 @@ def read_cross_month_makeup_holidays_from_excel(
     # 找到表頭
     header_row = None
     name_col = None
-    small_night_col = None
     holiday_cols = []
 
     def header_text(value):
@@ -1538,11 +1630,13 @@ def read_cross_month_makeup_holidays_from_excel(
         return col_pos
 
     def _pending_makeup_column(col_pos: int) -> int:
-        # 「X月補」不是原欄位保留，而是上月待補班在本月找位置補。
-        # 若它寫在上月最後一個假日欄，本月輸出從第 2 欄承接，避免壓到第一個假日欄。
-        if col_pos == len(holiday_cols):
-            return 2 if len(holiday_cols) >= 4 else 1
-        return _cross_month_skip_column(col_pos)
+        # 「待補班」「X月補」是未指定日期的額外補班債務，上個月的文字
+        # 剛好寫在哪一欄純屬巧合、不代表任何欄位延續性（不像「-」或
+        # P1/P2 那種真正需要延續同一欄的紀錄）。額外補班本身有最高
+        # 優先權，永遠從第 1 欄開始搶；避免和正常輪值撞欄的責任交給
+        # holiday_shift.py 的 global_column_baseline（一旦本月有人需要
+        # 額外補班，所有「非額外補班」的結果都會自動從第 2 欄起算）。
+        return 1
 
     nurse_makeups = {}
     prev_month = target_month - 1 if target_month > 1 else 12

@@ -90,6 +90,18 @@ class HolidayShiftResult:
     is_skipped: bool = False         # 是否為跳過記錄（不排班，只顯示原因）
     skip_reason: str = ''            # 跳過原因（公休、P/換心、國定假日補償等）
     is_extra_makeup: bool = False    # 是否為獨立「假日額外補班」結果
+    is_placeholder: bool = False     # slot 只是顯示用的佔位符，不是真的在那個 slot 上過班
+                                      # （例如上月結轉紀錄借本月第一個 slot 顯示），duplicate check 必須排除
+    # 明確區分「這筆結果是怎麼來的」，避免 is_makeup 一個欄位混用兩種不同語意
+    # （額外多上一班 vs 正常輪值只是延後排）。
+    # 'extra_makeup'：待補班／額外補班／X月補——本月比正常輪值多上一班，不消耗正常輪值資格。
+    # 'normal'：正常輪值直接排到（含公休/P班/換心等直接跳過，本質仍是她的正常輪值）。
+    # 'deferred_normal'：正常輪值因衝突被延後，之後找到 slot 回補——本質仍是正常輪值，不是多上的班。
+    # 'return_credit'：還班，抵掉這次正常輪值（上月結轉的補償）。
+    # 'holiday_compensation'：國假補償，抵掉這次正常輪值（本月產生的補償）。
+    # 'carryover_fixed'：上月已經確認、原封不動保留到本月的紀錄（跨月固定班／跨月欄位保留），
+    #                    不算本月新產生的任何一種輪值結果。
+    assignment_source: str = 'normal'
 
 
 def get_weekend_key(date: datetime) -> str:
@@ -602,25 +614,41 @@ def get_holiday_compensation_for_slot(
     nurse: NurseInfo,
     slot: HolidayShiftSlot,
     used_compensations: Dict[str, List[datetime]],  # {nurse_name: [已使用的國定假日]}
+    target_month: Optional[int] = None,
+    approved_return_credits: Optional[Dict[str, int]] = None,
 ) -> Optional[Dict]:
     """
     檢查護理人員是否有可用的國定假日補償
-    
-    只檢查上個月跨月排班中包含本月國定假日的記錄
-    （這些記錄在排班開始前被記錄到 holiday_compensations_used）
+
+    本月產生的補償（comp_date.month == target_month）：照原本規則自動可用。
+    上月結轉的補償（還班，comp_date.month != target_month）：
+    只有在 approved_return_credits 中核准、且核准次數還沒用完，才算可用——
+    不能因為 holiday_compensations_used 裡有舊資料就自動生效，必須經過 UI 人工核准。
 
     返回補償資訊或None
     """
     nurse_used = used_compensations.get(nurse.name, [])
     nurse_used_dates = set(d.date() for d in nurse_used)
+    approved_return_credits = approved_return_credits or {}
+
+    # 這個人這次排班已經消耗掉幾筆「還班」（上月結轉）額度
+    carry_over_used_count = sum(
+        1 for d in nurse_used
+        if target_month is not None and d.month != target_month
+    )
+    approved_count = approved_return_credits.get(nurse.name, 0)
 
     eligible = []  # [(shift_type, date)]
 
-    # 只檢查上個月跨月排班中包含本月國定假日的記錄
     for comp_date in nurse.holiday_compensations_used:
-        if comp_date.date() not in nurse_used_dates:
-            # 判斷是大夜還是小夜（這裡無法確定，統一標記為「平日大小夜」）
-            eligible.append(('平日大小夜', comp_date))
+        if comp_date.date() in nurse_used_dates:
+            continue
+        is_carry_over = target_month is not None and comp_date.month != target_month
+        if is_carry_over and carry_over_used_count >= approved_count:
+            # 上月結轉但沒有（或用完）UI 核准的還班額度，不能自動生效
+            continue
+        # 判斷是大夜還是小夜（這裡無法確定，統一標記為「平日大小夜」）
+        eligible.append(('平日大小夜', comp_date))
 
     if not eligible:
         return None
@@ -651,6 +679,8 @@ def check_should_skip_holiday_shift(
     target_year: int,
     used_compensations: Dict[str, List[datetime]],
     check_compensation: bool = True,
+    target_month: Optional[int] = None,
+    approved_return_credits: Optional[Dict[str, int]] = None,
 ) -> SkipInfo:
     """
     判斷護理人員是否應該跳過這次假日班
@@ -697,20 +727,24 @@ def check_should_skip_holiday_shift(
     if needs_adjust:
         return SkipInfo(True, reason, True, adjust_type)
 
-    # 7. 檢查是否有手動標記的「還班」需求（由 UI 標記）
-    # 如果當月有還班標記且尚未使用，則跳過一次假日值班（不需補班）
-    month_key = f'{slot.date.month}月'
-    if getattr(nurse, 'return_skip', {}).get(month_key) and not getattr(nurse, 'return_skip_used', {}).get(month_key):
-        return SkipInfo(True, '還班', False, is_compensation=True)
-
-    # 8. 檢查國定假日補償（可跳過，不用補，但每人只能跳過一次）
+    # 7. 檢查國定假日補償（可跳過，不用補，但每人只能跳過一次）
     # 注意：國假補償放在最後，只有在沒有其他硬性衝突時才會觸發
+    #
+    # 「還班」＝上個月產生但上個月沒用完、延到本月使用的國假補償。
+    # 兩者共用同一套資格池（nurse.holiday_compensations_used）與同一套消耗邏輯，
+    # 差別只在補償是哪個月產生的：本月產生、本月用 → 國假補償；
+    # 上月（或更早）產生、本月才用 → 還班。
     if check_compensation:
-        compensation = get_holiday_compensation_for_slot(nurse, slot, used_compensations)
+        compensation = get_holiday_compensation_for_slot(
+            nurse, slot, used_compensations, target_month=target_month,
+            approved_return_credits=approved_return_credits,
+        )
         if compensation:
+            is_carry_over = target_month is not None and compensation['date'].month != target_month
+            label = '還班' if is_carry_over else '國假補償'
             return SkipInfo(
                 True,
-                f"國假補償({compensation['date'].month}/{compensation['date'].day}{compensation['shift_type']})",
+                f"{label}({compensation['date'].month}/{compensation['date'].day}{compensation['shift_type']})",
                 False,
                 is_compensation=True
             )
@@ -726,6 +760,7 @@ def schedule_holiday_shifts(
     include_next_month_first: bool = True,
     regular_start_index: int = None,
     extra_makeup_entries: Optional[List[Dict]] = None,
+    approved_return_credits: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[HolidayShiftResult], str]:
     """
     排假日班
@@ -804,6 +839,8 @@ def schedule_holiday_shifts(
                 is_skipped=True,
                 skip_reason=original_text,
                 original_slot_text='跨月欄位保留',
+                assignment_source='carryover_fixed',
+                is_placeholder=True,
             ))
             print(f"  跨月跳過保留: {nurse.name} {original_text} [欄{column_index}]")
     
@@ -832,13 +869,26 @@ def schedule_holiday_shifts(
             cycle += 1
         return idx
 
-    def has_cross_month_record_in_column(nurse_name: str, column_index: int) -> bool:
-        return any(
-            result.nurse.name == nurse_name and
-            result.column_index == column_index and
-            result.is_cross_month_makeup
-            for result in results
-        )
+    # 全欄位基準線：若本月有人需要「額外補班」（待補班/額外補班/X月補，本質是
+    # 多上一班、必須排在正常輪值之前），該人的額外補班會佔用最前面的欄位；
+    # 為了讓所有人的欄位編號維持對齊、不會錯亂，本月「非額外補班」類型的結果
+    # （正常輪值、延後正常輪值、國假補償、還班、跨月固定班…）一律從基準線欄位
+    # 開始算起，不可以佔用被額外補班保留的欄位。實際數值於三個額外補班佇列
+    # 建立完成後才計算並覆寫（見下方）。
+    global_column_baseline = 1
+
+    def next_free_column(nurse_name: str, desired_column: int, is_extra_makeup: bool = False) -> int:
+        """輪序不變：欄位被占用只影響「這筆新結果顯示在哪一欄」，不影響是否輪到這個人。
+        若這個人在 desired_column 已經有紀錄（例如上月帶來的 P班/換心/國假/還班等
+        carry-over 顯示資料），這次新排到的班就往下一個空欄位放。
+        非額外補班的結果不可低於 global_column_baseline（見上方說明）。"""
+        used = {r.column_index for r in results if r.nurse.name == nurse_name}
+        col = desired_column if is_extra_makeup else max(desired_column, global_column_baseline)
+        while col in used:
+            col += 1
+        if col > 4:
+            print(f"  警告: {nurse_name} 的假日欄位已滿（超過4欄），這筆紀錄仍會建立在第{col}欄")
+        return col
 
     # 待補班佇列（需要找下一個可以的班）
     # 格式: [(nurse_index, original_slot, adjust_type, has_assigned_this_month, original_cycle), ...]
@@ -863,7 +913,8 @@ def schedule_holiday_shifts(
             return False
 
         skip_info = check_should_skip_holiday_shift(
-            nurse, slot, results, target_year, used_compensations
+            nurse, slot, results, target_year, used_compensations, target_month=target_month,
+            approved_return_credits=approved_return_credits,
         )
         if skip_info.should_skip:
             print(f"  補班暫不排 {nurse.name}: {skip_info.reason}")
@@ -885,6 +936,15 @@ def schedule_holiday_shifts(
             return False
 
         return True
+
+    # 「待補班」佇列：唯一辨識依據是備註/補班欄「明確」含「待補班」三個字。
+    # 不使用★、不使用單獨的「補班」二字、不使用補班志願順序等其他清單去推測。
+    pending_makeup_queue: List[int] = []
+    for idx, nurse in enumerate(nurses):
+        combined_text = f"{getattr(nurse, 'remarks', '')} {getattr(nurse, 'makeup_text', '')}"
+        if '待補班' in combined_text:
+            pending_makeup_queue.append(idx)
+            print(f"  {nurse.name} 標記為待補班人員（備註含「待補班」）")
 
     # 從上個月帶來的「X月補」純待補班 → 固定跨月補班處理完後優先排班
     print("\n處理上月帶來的假日待補班（X月補）...")
@@ -927,7 +987,30 @@ def schedule_holiday_shifts(
         slot_order = {item['id']: item['order'] for item in HOLIDAY_SHIFT_TYPES}
         all_slots.extend(manual_slots)
         all_slots.sort(key=lambda slot: (slot.date, slot_order.get(slot.shift_type_id, 99)))
-    
+
+    # 計算全欄位基準線：本月若有人需要額外補班（待補班/額外補班/X月補），
+    # 這種「多上一班」的紀錄必須排在正常輪值之前，會用掉這個人最前面的欄位；
+    # 為了讓整份班表的欄位編號在所有人之間保持一致（不然欄位會錯亂、無法對齊比較），
+    # 本月其餘所有「非額外補班」的結果（正常輪值、延後正常輪值、國假補償、還班、
+    # 跨月固定班等）都要從「額外補班用掉的欄位數 + 1」開始算，即使這個人自己完全
+    # 沒有額外補班。例如某人本月要多補一班，她自己排在第1欄，其他所有人的
+    # 正常輪值/補償欄位都要從第2欄開始，不能用第1欄。
+    _extra_makeup_counts: Dict[str, int] = {}
+    for _order, _nurse_idx, _entry in extra_makeup_queue:
+        _name = nurses[_nurse_idx].name
+        _extra_makeup_counts[_name] = _extra_makeup_counts.get(_name, 0) + 1
+    for _nurse_idx in pending_makeup_queue:
+        _name = nurses[_nurse_idx].name
+        _extra_makeup_counts[_name] = _extra_makeup_counts.get(_name, 0) + 1
+    for _nurse_idx, _column_index, _original_text, _target_date, _target_slot_type, _target_shift_type, _is_manual in pending_priority_queue:
+        _name = nurses[_nurse_idx].name
+        _extra_makeup_counts[_name] = _extra_makeup_counts.get(_name, 0) + 1
+    global_column_baseline = 1 + (max(_extra_makeup_counts.values()) if _extra_makeup_counts else 0)
+    if global_column_baseline > 1:
+        print(f"\n本月有額外補班需求（{_extra_makeup_counts}），"
+              f"正常輪值/補償欄位基準線設為第{global_column_baseline}欄，"
+              f"保留前{global_column_baseline - 1}欄給額外補班")
+
     for slot in all_slots:
 
         # 0. 先檢查這個時段是否被跨月補班佔用
@@ -949,19 +1032,21 @@ def schedule_holiday_shifts(
                     print(f"  跳過跨月固定班 {nurse.name} {slot.display_text}: 同一天已有假日班")
                     nurse = None
             if nurse:
+                assigned_column = next_free_column(nurse.name, cycle + 1)
                 result = HolidayShiftResult(
                     slot=slot,
                     nurse=nurse,
-                    column_index=cycle + 1,
+                    column_index=assigned_column,
                     is_cross_month_makeup=True,
+                    assignment_source='carryover_fixed',
                 )
                 results.append(result)
-                print(f"  跨月固定班: {nurse.name} {slot.display_text} [欄{cycle + 1}]")
+                print(f"  跨月固定班: {nurse.name} {slot.display_text} [欄{assigned_column}]")
                 continue  # 此時段已佔用，跳過後續輪值
         
         assigned = False
 
-        # 1. 假日額外補班：在假日待補與一般輪序前優先搶可排時段。
+        # 1. 假日額外補班：在待補班與一般輪序前優先搶可排時段。
         if extra_makeup_queue and slot.date.year == target_year and slot.date.month == target_month:
             for queue_idx, (order, nurse_idx, entry) in enumerate(list(extra_makeup_queue)):
                 nurse = nurses[nurse_idx]
@@ -970,10 +1055,11 @@ def schedule_holiday_shifts(
                 results.append(HolidayShiftResult(
                     slot=slot,
                     nurse=nurse,
-                    column_index=1,
+                    column_index=next_free_column(nurse.name, 1, is_extra_makeup=True),
                     is_makeup=True,
                     original_slot_text=entry.get('source') or '假日額外補班',
                     is_extra_makeup=True,
+                    assignment_source='extra_makeup',
                 ))
                 extra_makeup_queue.pop(queue_idx)
                 print(f"  ★ 假日額外補班: {nurse.name} {slot.display_text} (順位 {order})")
@@ -982,7 +1068,27 @@ def schedule_holiday_shifts(
         if assigned:
             continue
 
-        # 2. 上月帶來的「X月補」優先補班：固定跨月日期班排完後，先找第一個不衝突的格子
+        # 2. 「待補班」人員優先補班（辨識依據唯一是備註/補班欄明確含「待補班」文字）
+        for prio_idx, nurse_idx in enumerate(list(pending_makeup_queue)):
+            nurse = nurses[nurse_idx]
+            if not can_assign_makeup(nurse, slot):
+                continue
+            results.append(HolidayShiftResult(
+                slot=slot,
+                nurse=nurse,
+                column_index=next_free_column(nurse.name, 1, is_extra_makeup=True),
+                is_makeup=True,
+                original_slot_text='待補班優先',
+                assignment_source='extra_makeup',
+            ))
+            pending_makeup_queue.pop(prio_idx)
+            print(f"  ★ 待補班優先: {nurse.name} {slot.display_text}")
+            assigned = True
+            break
+        if assigned:
+            continue
+
+        # 3. 上月帶來的「X月補」優先補班：固定跨月日期班排完後，先找第一個不衝突的格子
         if pending_priority_queue:
             for pending_idx, (nurse_idx, column_index, original_text, target_date, target_slot_type, target_shift_type, is_manual) in enumerate(list(pending_priority_queue)):
                 if target_date:
@@ -997,22 +1103,24 @@ def schedule_holiday_shifts(
                     print(f"  跳過 {nurse.name} {slot.display_text}: 同一天已有假日班")
                     continue
                 if is_manual or can_assign_makeup(nurse, slot):
+                    assigned_column = next_free_column(nurse.name, column_index, is_extra_makeup=True)
                     results.append(HolidayShiftResult(
                         slot=slot,
                         nurse=nurse,
-                        column_index=column_index,
+                        column_index=assigned_column,
                         is_makeup=True,
                         original_slot_text=original_text,
+                        assignment_source='extra_makeup',
                     ))
                     pending_priority_queue.pop(pending_idx)
                     force_text = "手動指定" if is_manual else "優先補班"
-                    print(f"  ★ {force_text}: {nurse.name} {slot.display_text} (原{original_text}) [欄{column_index}]")
+                    print(f"  ★ {force_text}: {nurse.name} {slot.display_text} (原{original_text}) [欄{assigned_column}]")
                     assigned = True
                     break
             if assigned:
                 continue
 
-        # 3. 正常輪值
+        # 5. 跨月固定班（延後處理的部分）與本月輪序中因衝突暫跳的人回補，最後才是正常輪值
         attempts = 0
         this_slot_makeup_candidates = []
         if deferred_priority_queue and slot.date.day > 7:
@@ -1025,9 +1133,10 @@ def schedule_holiday_shifts(
                 results.append(HolidayShiftResult(
                     slot=slot,
                     nurse=nurse,
-                    column_index=1,
+                    column_index=next_free_column(nurse.name, 1),
                     is_makeup=True,
-                    original_slot_text='跨月固定班延後'
+                    original_slot_text='跨月固定班延後',
+                    assignment_source='carryover_fixed',
                 ))
                 deferred_priority_queue.pop(0)
                 print(f"  ★ 延後跨月補班: {nurse.name} {slot.display_text}")
@@ -1044,9 +1153,10 @@ def schedule_holiday_shifts(
                 results.append(HolidayShiftResult(
                     slot=slot,
                     nurse=nurse,
-                    column_index=1,
+                    column_index=next_free_column(nurse.name, 1),
                     is_makeup=True,
-                    original_slot_text='跨月大夜改補小夜'
+                    original_slot_text='跨月大夜改補小夜',
+                    assignment_source='carryover_fixed',
                 ))
                 deferred_small_night_queue.pop(0)
                 print(f"  ★ 跨月大夜改補小夜: {nurse.name} {slot.display_text}")
@@ -1063,7 +1173,8 @@ def schedule_holiday_shifts(
                 continue
 
             skip_info = check_should_skip_holiday_shift(
-                nurse, slot, results, target_year, used_compensations
+                nurse, slot, results, target_year, used_compensations, target_month=target_month,
+                approved_return_credits=approved_return_credits,
             )
             if skip_info.should_skip:
                 continue
@@ -1078,9 +1189,10 @@ def schedule_holiday_shifts(
             results.append(HolidayShiftResult(
                 slot=slot,
                 nurse=nurse,
-                column_index=mq_cyc + 1,
+                column_index=next_free_column(nurse.name, mq_cyc + 1),
                 is_makeup=True,
                 original_slot_text=original_text,
+                assignment_source='deferred_normal',
             ))
             makeup_queue.pop(queued_idx)
             print(f"  輪序回補: {nurse.name} {slot.display_text} (原 {original_text})")
@@ -1092,24 +1204,6 @@ def schedule_holiday_shifts(
 
         while attempts < len(nurses):
             nurse = nurses[current_index]
-
-            if pending_notice_count >= 2 and has_cross_month_record_in_column(nurse.name, cycle + 1):
-                print(f"  跳過 {nurse.name}: 第{cycle + 1}欄已有跨月固定班")
-                current_index = advance_index(current_index)
-                attempts += 1
-                continue
-
-            if any(
-                r.nurse.name == nurse.name
-                and r.column_index == cycle + 1
-                and r.is_skipped
-                and r.original_slot_text == '跨月欄位保留'
-                for r in results
-            ):
-                print(f"  跳過 {nurse.name}: 第{cycle + 1}欄已有跨月跳過記錄")
-                current_index = advance_index(current_index)
-                attempts += 1
-                continue
 
             # 若此人在 makeup_queue，隨輪序補班（不搶先）
             in_makeup = [(qi, e) for qi, e in enumerate(makeup_queue) if e[0] == current_index]
@@ -1125,18 +1219,21 @@ def schedule_holiday_shifts(
                     if h1 or h2 or h3: can_assign = False
                 if can_assign:
                     ot = mq_slot.display_text if mq_slot else '無指定'
-                    results.append(HolidayShiftResult(slot=slot, nurse=nurse, column_index=mq_cyc+1, is_makeup=True, original_slot_text=ot))
+                    results.append(HolidayShiftResult(slot=slot, nurse=nurse, column_index=next_free_column(nurse.name, mq_cyc + 1), is_makeup=True, original_slot_text=ot, assignment_source='deferred_normal'))
                     makeup_queue.pop(qi)
                     print(f"  ★ 隨輪序補班: {nurse.name} {slot.display_text} (原{ot})")
                     assigned = True
                     break
 
-            # 檢查這個護士是否在這個 slot 已有記錄（包括 is_skipped 記錄）
-            # 防止同一個 slot 為同一個護士創建多個記錄
+            # 檢查這個護士是否在這個 slot 已有「真實」記錄（防止同一個 slot 被同一個護士重複建立）。
+            # 上月帶進來的 carry-over 顯示紀錄借本月第一個 slot 當 placeholder 顯示（is_placeholder=True），
+            # 不是真的在那個 slot 上過班，duplicate check 要排除它，
+            # 否則會誤判成「已有記錄」而整個跳過這個人的正常輪值機會。
             slot_already_has_record = any(
                 r.nurse.name == nurse.name and
                 r.slot.date.date() == slot.date.date() and
-                r.slot.shift_type_id == slot.shift_type_id
+                r.slot.shift_type_id == slot.shift_type_id and
+                not r.is_placeholder
                 for r in results
             )
             if slot_already_has_record:
@@ -1154,7 +1251,8 @@ def schedule_holiday_shifts(
                 continue
 
             skip_info = check_should_skip_holiday_shift(
-                nurse, slot, results, target_year, used_compensations
+                nurse, slot, results, target_year, used_compensations, target_month=target_month,
+                approved_return_credits=approved_return_credits,
             )
 
             if not skip_info.should_skip:
@@ -1174,7 +1272,8 @@ def schedule_holiday_shifts(
                 result = HolidayShiftResult(
                     slot=slot,
                     nurse=nurse,
-                    column_index=cycle + 1,
+                    column_index=next_free_column(nurse.name, cycle + 1),
+                    assignment_source='normal',
                 )
                 results.append(result)
                 assigned_this_month.add(nurse.name)
@@ -1192,34 +1291,10 @@ def schedule_holiday_shifts(
                 
                 # 處理國定假日補償
                 if skip_info.is_compensation:
-                    # 特殊處理：如果是 UI 標記的「還班」，直接消耗標記並產生跳過記錄
-                    if skip_info.reason == '還班':
-                        month_key = f"{slot.date.month}月"
-                        # 標記為已使用
-                        nurse.return_skip_used[month_key] = True
-                        # 產生跳過記錄
-                        result = HolidayShiftResult(
-                            slot=slot,
-                            nurse=nurse,
-                            column_index=cycle + 1,
-                            is_skipped=True,
-                            skip_reason='還班',
-                        )
-                        results.append(result)
-                        print(f"  {nurse.name} 還班跳過：已消耗還班標記")
-                        # 若此人已在待補佇列，從佇列移除一筆
-                        makeup_entry_idx = None
-                        for i, entry in enumerate(makeup_queue):
-                            if entry[0] == current_index:
-                                makeup_entry_idx = i
-                                break
-                        if makeup_entry_idx is not None:
-                            makeup_queue.pop(makeup_entry_idx)
-                            print(f"    -> 還班抵消待補班，從佇列中移除 {nurse.name} 的 1 筆記錄")
-                        current_index = advance_index(current_index)
-                        attempts += 1
-                        continue
-                    compensation = get_holiday_compensation_for_slot(nurse, slot, used_compensations)
+                    compensation = get_holiday_compensation_for_slot(
+                        nurse, slot, used_compensations, target_month=target_month,
+                        approved_return_credits=approved_return_credits,
+                    )
                     if compensation:
                         # 取得假日班的日期和平日國定假日的日期
                         slot_date = slot.date.date()  # 假日班日期
@@ -1242,19 +1317,22 @@ def schedule_holiday_shifts(
                             print(f"  {nurse.name} 已上過{comp_date.month}/{comp_date.day}班 → 補休假跳過")
                             print(f"    -> compensation skip (已用{used_count}次, 剩餘{remaining}次)")
                             
-                            # 檢查該護士是否在待補班佇列中，如果在，使用原本被跳過時的 cycle
-                            use_column_index = cycle + 1  # 預設使用當前 cycle
+                            # 這筆國假補償／還班抵掉的是「現在這次輪值」，跟 makeup_queue 裡
+                            # 可能存在的其他欠班義務是兩件獨立的事——只有當佇列裡剛好有一筆
+                            # entry 是「這次、這個 slot」本身時，才代表同一件事、可以移除；
+                            # 不能只因為 nurse_idx 相同就把她先前累積的欠班一起清掉。
+                            use_column_index = next_free_column(nurse.name, cycle + 1)  # 預設使用當前 cycle，避開已佔用欄位
                             makeup_entry_idx = None
                             print(f"    -> [正常輪值] {nurse.name} 檢查待補班佇列: current_index={current_index}, 當前cycle={cycle}")
                             for i, entry in enumerate(makeup_queue):
                                 entry_nurse_idx, entry_slot, _, _, entry_original_cycle = entry
                                 print(f"       佇列[{i}]: nurse_idx={entry_nurse_idx}, original_cycle={entry_original_cycle}")
-                                if entry_nurse_idx == current_index:
-                                    use_column_index = entry_original_cycle + 1
+                                if entry_nurse_idx == current_index and entry_slot is slot:
+                                    use_column_index = next_free_column(nurse.name, entry_original_cycle + 1)
                                     makeup_entry_idx = i
-                                    print(f"    -> 在待補班佇列中找到，使用原欄位 {use_column_index}")
+                                    print(f"    -> 待補班佇列中同一個 slot 的欠班，使用原欄位 {use_column_index}")
                                     break
-                            
+
                             print(f"    ★★★ [正常輪值] {nurse.name} 補償跳過記錄: use_column_index={use_column_index}")
                             # 創建國定假日補償跳過記錄
                             result = HolidayShiftResult(
@@ -1266,14 +1344,15 @@ def schedule_holiday_shifts(
                                 is_holiday_compensation=True,
                                 compensation_date=compensation['date'],
                                 compensation_shift_type=compensation['shift_type'],
+                                assignment_source='return_credit' if skip_info.reason.startswith('還班') else 'holiday_compensation',
                             )
                             results.append(result)
 
-                            # 國假補償跳過「抵消」待補班：從佇列中移除該護士的 1 筆記錄
-                            # （1 次國假補償只能抵消 1 次待補班）
+                            # 只有佇列裡「同一個 slot」的欠班才會被這次補償/還班抵消；
+                            # 她之前累積的其他欠班義務維持獨立、不受影響。
                             if makeup_entry_idx is not None:
                                 makeup_queue.pop(makeup_entry_idx)
-                                print(f"    -> 國假補償抵消待補班，從佇列中移除 {nurse.name} 的 1 筆記錄")
+                                print(f"    -> 國假補償/還班抵消了同一個 slot 的欠班，從佇列中移除 {nurse.name} 的 1 筆記錄")
 
                             current_index = advance_index(current_index)
                             attempts += 1
@@ -1313,7 +1392,8 @@ def schedule_holiday_shifts(
                             result = HolidayShiftResult(
                                 slot=slot,
                                 nurse=nurse,
-                                column_index=cycle + 1,
+                                column_index=next_free_column(nurse.name, cycle + 1),
+                                assignment_source='normal',
                             )
                             results.append(result)
                             assigned_this_month.add(nurse.name)
@@ -1333,9 +1413,10 @@ def schedule_holiday_shifts(
                     result = HolidayShiftResult(
                         slot=slot,
                         nurse=nurse,
-                        column_index=cycle + 1,
+                        column_index=next_free_column(nurse.name, cycle + 1),
                         is_skipped=True,
                         skip_reason='-' if skip_info.reason in ['公休', '婚假'] else skip_info.reason,
+                        assignment_source='normal',
                     )
                     results.append(result)
                 
@@ -1352,7 +1433,7 @@ def schedule_holiday_shifts(
                 chosen_idx, chosen_nurse = this_slot_makeup_candidates[0]
                 for qi, e in enumerate(makeup_queue):
                     if e[0] == chosen_idx and e[1] is slot: makeup_queue.pop(qi); break
-                results.append(HolidayShiftResult(slot=slot, nurse=chosen_nurse, column_index=cycle+1))
+                results.append(HolidayShiftResult(slot=slot, nurse=chosen_nurse, column_index=next_free_column(chosen_nurse.name, cycle + 1), assignment_source='deferred_normal'))
                 assigned_this_month.add(chosen_nurse.name)
                 last_normal_assigned_name = chosen_nurse.name
                 print(f"  警告: 強制排班: {chosen_nurse.name} {slot.display_text}")
@@ -1368,14 +1449,17 @@ def schedule_holiday_shifts(
         print(f"\n注意: 以下上月待補班本月找不到合適的班:")
         for nurse_idx, column_index, original_text, _target_date, _target_slot_type, _target_shift_type, _is_manual in pending_priority_queue:
             nurse = nurses[nurse_idx]
+            assigned_column = next_free_column(nurse.name, column_index, is_extra_makeup=True)
             results.append(HolidayShiftResult(
                 slot=fallback_slot,
                 nurse=nurse,
-                column_index=column_index,
+                column_index=assigned_column,
                 is_skipped=True,
                 skip_reason=pending_text,
+                is_placeholder=True,
+                assignment_source='extra_makeup',
             ))
-            print(f"  - {nurse.name} ({original_text}) [欄{column_index}] → {pending_text}")
+            print(f"  - {nurse.name} ({original_text}) [欄{assigned_column}] → {pending_text}")
 
     # 處理待補班佇列中剩餘的人
     if makeup_queue:
@@ -1392,20 +1476,35 @@ def schedule_holiday_shifts(
                     d for d in available_compensations
                     if d.date() not in {used.date() for used in used_compensations.get(nurse.name, [])}
                 ]
-                if unused_compensations:
-                    comp_date = sorted(unused_compensations)[0]
+                # 上月結轉（還班）一樣要走 UI 核准額度的閘門，不能因為
+                # holiday_compensations_used 裡有舊資料就自動生效。
+                approved_count = (approved_return_credits or {}).get(nurse.name, 0)
+                carry_over_used_count = sum(
+                    1 for d in used_compensations.get(nurse.name, [])
+                    if d.month != target_month
+                )
+                eligible_compensations = [
+                    d for d in unused_compensations
+                    if d.month == target_month or carry_over_used_count < approved_count
+                ]
+                if eligible_compensations:
+                    comp_date = sorted(eligible_compensations)[0]
                     used_compensations.setdefault(nurse.name, []).append(comp_date)
+                    is_carry_over = comp_date.month != target_month
+                    label = '還班' if is_carry_over else '國假補償'
+                    assigned_column = next_free_column(nurse.name, original_cycle + 1)
                     results.append(HolidayShiftResult(
                         slot=original_slot,
                         nurse=nurse,
-                        column_index=original_cycle + 1,
+                        column_index=assigned_column,
                         is_skipped=True,
-                        skip_reason=f"國假補償({comp_date.month}/{comp_date.day}平日大小夜)",
+                        skip_reason=f"{label}({comp_date.month}/{comp_date.day}平日大小夜)",
                         is_holiday_compensation=True,
                         compensation_date=comp_date,
                         compensation_shift_type='平日大小夜',
+                        assignment_source='return_credit' if is_carry_over else 'holiday_compensation',
                     ))
-                    print(f"  - {nurse.name} (原{original_slot.display_text}{adjust_desc}) [原欄位{original_cycle + 1}] → 補{comp_date.month}/{comp_date.day}")
+                    print(f"  - {nurse.name} (原{original_slot.display_text}{adjust_desc}) [原欄位{assigned_column}] → 補{comp_date.month}/{comp_date.day}")
                     continue
 
                 next_month = target_month + 1 if target_month < 12 else 1
@@ -1422,14 +1521,16 @@ def schedule_holiday_shifts(
                 if nurse.is_transplant.get(next_month_key) or nurse.is_p1.get(next_month_key) or nurse.is_p2.get(next_month_key):
                     pending_text = f'{pending_month}月補'
 
+                assigned_column = next_free_column(nurse.name, original_cycle + 1)
                 results.append(HolidayShiftResult(
                     slot=original_slot,
                     nurse=nurse,
-                    column_index=original_cycle + 1,
+                    column_index=assigned_column,
                     is_skipped=True,
                     skip_reason=pending_text,
+                    assignment_source='deferred_normal',
                 ))
-                print(f"  - {nurse.name} (原{original_slot.display_text}{adjust_desc}) [原欄位{original_cycle + 1}] → {pending_text}")
+                print(f"  - {nurse.name} (原{original_slot.display_text}{adjust_desc}) [原欄位{assigned_column}] → {pending_text}")
             else:
                 print(f"  - {nurse.name} (原無指定{adjust_desc}) [原欄位{original_cycle + 1}]")
     
