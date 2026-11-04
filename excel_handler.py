@@ -22,9 +22,9 @@ from date_utils import (
 
 
 def get_sheet_names(filepath: str) -> List[str]:
-    """取得 Excel 所有頁籤名稱"""
+    """取得 Excel 要排班的頁籤名稱（上月輸出附帶的「排班前核對」頁不是班表，略過）"""
     wb = load_workbook(filepath, read_only=True)
-    names = wb.sheetnames
+    names = [name for name in wb.sheetnames if '排班前核對' not in name]
     wb.close()
     return names
 
@@ -419,6 +419,7 @@ def create_schedule_excel_multi_sheet(
         _write_pre_schedule_check_sheet(default_sheet, title, pre_schedule_checks, year, month)
         first_sheet = False
     
+    layouts = []
     for sheet_name, results in all_results.items():
         output_sheet_name = _format_output_sheet_name(sheet_name, year, month)
         if first_sheet:
@@ -428,10 +429,18 @@ def create_schedule_excel_multi_sheet(
         else:
             ws = wb.create_sheet(title=output_sheet_name)
         
-        _write_schedule_sheet(
+        layouts.append((ws, _write_schedule_sheet(
             ws, title, results, year, month, sheet_name
-        )
-    
+        )))
+
+    # 主值 / 副值用同一組欄寬（同一欄取各頁最寬的），印出來兩張表一樣大
+    shared_widths = {}
+    for ws, (columns, header_row, max_row) in layouts:
+        for name, width in zip(columns, _content_column_widths(ws, columns, header_row, max_row)):
+            shared_widths[name] = max(shared_widths.get(name, 0), width)
+    for ws, (columns, header_row, max_row) in layouts:
+        _fit_table_for_a4_print(ws, columns, header_row, max_row, [shared_widths[name] for name in columns])
+
     wb.save(output_path)
 
 
@@ -631,6 +640,15 @@ def _write_pre_schedule_check_sheet(
 
     ws.freeze_panes = ws.cell(row=detail_header_row + 1, column=1)
 
+    # 列印：A4 橫向、寬度縮成一頁，長度可以多頁
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_margins.left = ws.page_margins.right = 0.4
+    ws.print_options.horizontalCentered = True
+
 
 def _is_all_dates_other_month(text: str, year: int, month: int) -> bool:
     """
@@ -744,6 +762,24 @@ def _to_inline_font(font):
     )
 
 
+def _with_cross_month_carryover(results, previous_dates, month_start: datetime):
+    """
+    上月排的大夜 / 小夜週跨到本月（例如 12/31.1/1.1/2、12/28-1/1）：
+    放回本月表上保留顯示，上月的日期用灰色。
+    """
+    taken = {d.date() for result in results for d in result.get('dates', [])}
+    carried = []
+    group = []
+    for d in sorted(previous_dates or []) + [None]:
+        if group and (d is None or (d - group[-1]).days != 1):
+            if group[0] < month_start <= group[-1] and not any(x.date() in taken for x in group):
+                carried.append({'dates': list(group), 'gray_before': month_start})
+            group = []
+        if d is not None:
+            group.append(d)
+    return carried + list(results)
+
+
 def _build_night_rich_text(
     results, base_font, saturday_font, holiday_font, gray_font, second_round_font
 ):
@@ -767,10 +803,13 @@ def _build_night_rich_text(
                 parts.append(TextBlock(gray_font, f"{date.month}/{date.day}"))
         else:
             # 當月的 cost，根據日期特性設置顏色
+            gray_before = result.get('gray_before')
             for i, date in enumerate(dates):
                 if i > 0:
                     parts.append(TextBlock(base_font, "."))
-                if is_holiday(date):
+                if gray_before and date < gray_before:
+                    font = gray_font
+                elif is_holiday(date):
                     font = holiday_font
                 elif is_saturday(date):
                     font = saturday_font
@@ -820,8 +859,11 @@ def _build_small_night_rich_text(results, base_font, holiday_font, gray_font, ta
             parts.append(TextBlock(gray_font, f"{last_date.month}/{last_date.day}"))
         else:
             # 屬於當月的 cost，逐個日期檢查是否為國定假日
-            # 首日期
-            if is_holiday(first_date):
+            # 首日期（上月跨過來的用灰色）
+            gray_before = result.get('gray_before')
+            if gray_before and first_date < gray_before:
+                parts.append(TextBlock(gray_font, f"{first_date.month}/{first_date.day}"))
+            elif is_holiday(first_date):
                 parts.append(TextBlock(holiday_font, f"{first_date.month}/{first_date.day}"))
             else:
                 parts.append(TextBlock(base_font, f"{first_date.month}/{first_date.day}"))
@@ -945,8 +987,6 @@ def _write_schedule_sheet(
     for i in range(1, 5):
         columns.append(f'假日{i}')
         display_headers.append('假日')
-    columns.append('補班')
-    display_headers.append('補班')
     
     # 樣式定義 - 使用標楷體
     base_font_name = '標楷體'
@@ -1202,14 +1242,7 @@ def _write_schedule_sheet(
         cell.font = gray_font if is_other_month_remarks else green_font
         cell.alignment = center_align
 
-        # 補班（專屬欄位，一般補班區域）
-        makeup_text = ''
-
         col_indices = {name: idx for idx, name in enumerate(columns, 1)}
-        makeup_cell = ws.cell(row=row_idx, column=col_indices['補班'], value=makeup_text)
-        makeup_cell.border = border
-        makeup_cell.font = normal_font
-        makeup_cell.alignment = center_align
 
         extra_makeup_lines = {
             '大夜': [],
@@ -1271,12 +1304,16 @@ def _write_schedule_sheet(
             else:
                 nurse_identity = f'{month_key}P2'
         
-        # 4. 大夜
+        # 4. 大夜（含上月跨到本月的大夜）
+        month_start = datetime(year, month, 1)
+        night_cell_results = _with_cross_month_carryover(
+            nurse_night_results.get(nurse.name, []), nurse.manual_night_shift_dates, month_start
+        )
         night_cell = ws.cell(row=row_idx, column=col_indices['大夜'])
-        if nurse.name in nurse_night_results:
+        if night_cell_results:
             # 有排班結果，顯示排班結果
             night_cell.value = _build_night_rich_text(
-                nurse_night_results[nurse.name],
+                night_cell_results,
                 normal_font,
                 blue_font,
                 red_font,
@@ -1286,7 +1323,7 @@ def _write_schedule_sheet(
             night_cell.font = normal_font
             if any(
                 result.get('is_second_round')
-                for result in nurse_night_results[nurse.name]
+                for result in night_cell_results
             ):
                 night_cell.fill = PatternFill(
                     start_color='FFF2CC', end_color='FFF2CC', fill_type='solid'
@@ -1306,12 +1343,15 @@ def _write_schedule_sheet(
         night_cell.border = border
         night_cell.alignment = no_wrap_center_align
         
-        # 5. 小夜週
+        # 5. 小夜週（含上月跨到本月的小夜週）
+        small_night_cell_results = _with_cross_month_carryover(
+            nurse_small_night_results.get(nurse.name, []), nurse.manual_small_night_shift_dates, month_start
+        )
         small_night_cell = ws.cell(row=row_idx, column=col_indices['小夜週'])
-        if nurse.name in nurse_small_night_results:
+        if small_night_cell_results:
             # 有排班結果，顯示排班結果
             small_night_cell.value = _build_small_night_rich_text(
-                nurse_small_night_results[nurse.name],
+                small_night_cell_results,
                 normal_font,
                 red_font,
                 gray_font,
@@ -1403,44 +1443,69 @@ def _write_schedule_sheet(
     # 主值, 公休, 備註, 大夜, 小夜週, 補班, 額外補班, 假日, 假日, 假日, 假日
     _apply_identity_font(ws, green_font, gray_font, month)
 
-    max_col = len(columns)
     max_row = data_row - 1
-    column_widths = [0] * max_col
+    return columns, header_row, max_row
 
-    # 計算每欄的最大寬度（考慮兩行文字）
+
+# 備註這類長文字欄位的最大寬度（超過就自動換行），讓整張表能用接近原尺寸印在一張 A4 上
+_PRINT_MAX_COLUMN_WIDTH = {'備註': 20, '公休': 16}
+_PRINT_LINE_HEIGHT = 14.5  # 11pt 字一行的高度（pt）
+
+
+def _content_column_widths(ws, columns, header_row, max_row):
+    """每欄照內容算出剛好的寬度（不留多餘空白，長文字欄位有上限、超過換行）。"""
+    widths = []
+    for col in range(1, len(columns) + 1):
+        longest = 0
+        for row in range(header_row, max_row + 1):
+            text = _get_cell_text(ws.cell(row=row, column=col).value)
+            for line in (text.splitlines() if text else []):
+                longest = max(longest, _text_display_width(line))
+        cap = _PRINT_MAX_COLUMN_WIDTH.get(columns[col - 1])
+        width = max(longest + 2, 6)
+        if cap:
+            width = min(width, cap)
+        widths.append(width)
+    return widths
+
+
+def _fit_table_for_a4_print(ws, columns, header_row, max_row, widths):
+    """
+    套用欄寬、依內容算列高，並設定 A4 橫向、每個頁籤印成一頁。
+    表格越緊湊，Excel「縮放成一頁」時縮得越少，印出來的字就越大。
+    """
+    max_col = len(columns)
+    for col, width in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    # 列高：依這列最多幾行字（含自動換行）決定
     for row in range(header_row, max_row + 1):
+        line_count = 1
         for col in range(1, max_col + 1):
-            value = ws.cell(row=row, column=col).value
-            text = _get_cell_text(value)
-            lines = text.splitlines() if text else ['']
-            # 計算兩行文字的最大寬度
-            if len(lines) >= 2:
-                # 如果有兩行或更多，取前兩行的最大寬度
-                two_line_width = max(_text_display_width(line) for line in lines[:2])
-                max_len = max(max(_text_display_width(line) for line in lines), two_line_width)
-            else:
-                # 如果只有一行，假設第二行也是同樣寬度（模擬兩行）
-                single_line_width = max(_text_display_width(line) for line in lines) if lines else 0
-                max_len = single_line_width * 1.2  # 稍微增加寬度以容納兩行
-            if max_len > column_widths[col - 1]:
-                column_widths[col - 1] = max_len
+            cell = ws.cell(row=row, column=col)
+            text = _get_cell_text(cell.value)
+            if not text:
+                continue
+            wraps = bool(cell.alignment and cell.alignment.wrap_text)
+            usable = max(widths[col - 1] - 1, 1)
+            lines = 0
+            for line in text.splitlines() or ['']:
+                width = _text_display_width(line)
+                lines += max(1, -(-int(width) // int(usable))) if wraps else 1
+            line_count = max(line_count, lines)
+        ws.row_dimensions[row].height = line_count * _PRINT_LINE_HEIGHT + 6
 
-    min_widths = [8, 12, 16] + [12] * (len(columns) - 3)
-    max_width = None
-    width_by_col = []
-    for col_idx, max_len in enumerate(column_widths, 1):
-        min_width = min_widths[col_idx - 1] if col_idx - 1 < len(min_widths) else 10
-        # 確保寬度足夠容納兩行文字，加上一些邊距
-        width = max(max_len + 2, min_width) + 5
-        if max_width is not None:
-            width = min(width, max_width)
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-        width_by_col.append(width)
-
-    # 設定所有資料列的列高為兩行的高度（統一大小）
-    two_line_height = 24 * 2  # 兩行的高度
-    for row in range(header_row, max_row + 1):
-        ws.row_dimensions[row].height = two_line_height
+    # 列印設定：A4 橫向、整個頁籤縮成一頁、窄邊界、水平置中
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 1
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_margins.left = ws.page_margins.right = 0.4
+    ws.page_margins.top = ws.page_margins.bottom = 0.4
+    ws.page_margins.header = ws.page_margins.footer = 0.2
+    ws.print_options.horizontalCentered = True
+    ws.print_area = f"A1:{get_column_letter(max_col)}{max_row}"
 
 def read_cross_month_makeup_holidays_from_excel(
     filepath: str,

@@ -9,6 +9,7 @@ import io
 import json
 import calendar
 import hashlib
+import re
 from datetime import date, datetime, timedelta
 from contextlib import redirect_stdout
 
@@ -385,7 +386,7 @@ if modules_loaded:
 
     def build_quality_notes(results):
         notes = []
-        pre_check = results.get('pre_schedule_check', {})
+        pre_check = results.get('pre_schedule_check') or {}
         nurse_names = {_nurse_name(nurse) for nurse in results.get('nurses', [])}
         manual_overrides = results.get('manual_anchor_overrides') or {}
         manual_shift_entries = results.get('manual_shift_entries') or []
@@ -748,33 +749,33 @@ if modules_loaded:
     }
     _RETURN_CREDIT_EFFECTIVE_OPTIONS = ["接下來第一班", "指定日期後"]
 
+    def get_return_credit_candidates(sheet_name, check):
+        # 上月結轉候選只解析一次、存進 session_state，之後重跑直接沿用。
+        cache = st.session_state.detected_return_credit_candidates
+        if sheet_name not in cache:
+            cache[sheet_name] = get_return_credit_candidates_from_nurses(
+                sheet_name,
+                check.get('nurses') or [],
+                check.get('year'),
+                check.get('month'),
+                check.get('previous_entries'),
+            )
+        return cache[sheet_name]
+
     def render_return_credit_section(sheet_names, pre_schedule_checks):
-        st.header("📋 還班設定")
-        st.info(
+        st.caption(
             "還班＝抵掉一次之後的正常假日輪值（不是補班，不會多上一班）。"
-            "本月排班中新產生的國假補償會自動套用，不需要在這裡核准；"
-            "這裡只處理「核准上月結轉的舊資格」或「手動新增」。",
-            icon="ℹ️",
+            "本月新產生的國假補償會自動套用，這裡只處理「上月結轉」與「手動新增」。"
         )
 
         approved = st.session_state.approved_return_credits  # Dict[str, ReturnCredit]
 
-        # 收集各頁籤的上月結轉候選（只解析一次、存進 session_state，之後重跑直接沿用）。
         all_candidates = []
         for sheet_name in sheet_names:
             check = pre_schedule_checks.get(sheet_name)
             if not check:
                 continue
-            if sheet_name not in st.session_state.detected_return_credit_candidates:
-                st.session_state.detected_return_credit_candidates[sheet_name] = (
-                    get_return_credit_candidates_from_nurses(
-                        sheet_name,
-                        check.get('nurses') or [],
-                        check.get('year'),
-                        check.get('month'),
-                    )
-                )
-            all_candidates.extend(st.session_state.detected_return_credit_candidates[sheet_name])
+            all_candidates.extend(get_return_credit_candidates(sheet_name, check))
 
         # ---------------- 上月結轉候選：一張表 + 一個送出按鈕 ----------------
         # 全部包在 st.form 裡：改欄位（核准/生效方式/生效日期）不會整頁重跑，
@@ -984,8 +985,7 @@ if modules_loaded:
                         st.info("沒有勾選要移除的項目。")
 
     def render_pre_schedule_checks(pre_checks):
-        st.header("🔎 排班前檢查")
-        st.caption("先看總覽，有需要再進入自填班、補班或跨月資料調整。")
+        st.caption("系統已自動帶入 Excel 讀到的待補班；需要時可調整補班順序、常規起頭人員或補班說明。")
 
         for sheet_name, check in pre_checks.items():
             nurses = check.get('nurses', [])
@@ -993,7 +993,7 @@ if modules_loaded:
             carryover_records_by_nurse = check.get('carryover_records_by_nurse', {})
             previous_entries = check.get('previous_entries', {})
 
-            with st.expander(f"📄 {sheet_name}", expanded=True):
+            with st.expander(f"📄 {sheet_name}", expanded=len(pre_checks) == 1):
                 nurse_names = [nurse.name for nurse in nurses]
                 missing_previous = [nurse.name for nurse in nurses if nurse.name not in previous_entries]
                 manual_shift_key = _manual_shift_key(sheet_name)
@@ -1224,70 +1224,218 @@ if modules_loaded:
                         placeholder="例如：請優先補班 5/10-5/12 小夜；或：本週補班以補大夜為主。",
                     )
     
-    def render_shift_preview(results, month):
-        tab_night, tab_small, tab_holiday = st.tabs(["大夜", "小夜週", "假日班"])
+    # ------------------------------------------------------------------
+    # 排班結果：跟 Excel 一樣的表格 + 點一列看「為什麼這樣排」
+    # ------------------------------------------------------------------
 
-        with tab_night:
-            rows = []
-            for result in results.get('night_results', []):
-                rows.append({
-                    "日期": format_night_shift_result(result),
-                    "姓名": result['nurse'].name,
-                    "類型": (
-                        "第二輪"
-                        if result.get('is_second_round')
-                        else ("補班" if result.get('is_makeup') else "正常")
-                    ),
-                    "狀態": _status_tags(
-                        "下月" if result.get('is_next_month') else '',
-                        "第二輪" if result.get('is_second_round') else '',
-                        "定位點" if result.get('is_last_normal') else '',
-                    ),
-                })
-            st.table(rows or [{"日期": "-", "姓名": "-", "類型": "無資料", "狀態": "-"}])
+    def _excel_color(color):
+        """openpyxl 顏色（'FFFF0000' / '00A0A0A0'）轉成 CSS；沒有指定就回傳 None。"""
+        rgb = getattr(color, 'rgb', None)
+        if isinstance(rgb, str) and len(rgb) in (6, 8):
+            return '#' + rgb[-6:]
+        return None
 
-        with tab_small:
-            rows = []
-            for result in results.get('small_night_results', []):
-                rows.append({
-                    "日期": format_small_night_shift_result(result),
-                    "姓名": result['nurse'].name,
-                    "類型": "補班" if result.get('is_makeup') else "正常",
-                    "狀態": _status_tags(
-                        "下月" if result.get('is_next_month') else '',
-                        "定位點" if result.get('is_last_normal') else '',
-                    ),
-                })
-            st.table(rows or [{"日期": "-", "姓名": "-", "類型": "無資料", "狀態": "-"}])
+    def _excel_cell_html(cell):
+        """把一格 Excel 轉成 HTML，保留每一段文字自己的顏色（例如灰色的上月日期、紅色的國定假日）。"""
+        import html as html_lib
+        from openpyxl.cell.rich_text import CellRichText
 
-        with tab_holiday:
+        value = cell.value
+        cell_color = _excel_color(cell.font.color) if cell.font else None
+        cell_bold = bool(cell.font and cell.font.b)
+
+        def span(text, color=None, bold=False):
+            text = html_lib.escape(text).replace('\n', '<br>')
+            style = ''
+            if color:
+                style += f'color:{color};'
+            if bold:
+                style += 'font-weight:700;'
+            return f'<span style="{style}">{text}</span>' if style else text
+
+        if value is None:
+            return ''
+        if isinstance(value, CellRichText):
+            parts = []
+            for block in value:
+                if isinstance(block, str):
+                    parts.append(span(block, cell_color, cell_bold))
+                else:
+                    font = block.font
+                    color = _excel_color(font.color) if font is not None and font.color is not None else cell_color
+                    bold = bool(font.b) if font is not None and font.b is not None else cell_bold
+                    parts.append(span(block.text, color, bold))
+            return ''.join(parts)
+        return span(str(value), cell_color, cell_bold)
+
+    def _excel_table_html(ws, header_row, last_col, data_rows):
+        """把排班頁籤畫成跟 Excel 一樣的表格（白底、灰表頭、框線、標楷體、每段文字的顏色）。"""
+        def cell_tag(tag, cell, extra_style=''):
+            fill = None
+            if cell.fill is not None and cell.fill.fill_type == 'solid':
+                fill = _excel_color(cell.fill.fgColor)
+            style = (
+                'border:1px solid #000000;padding:3px 8px;text-align:center;vertical-align:middle;'
+                'white-space:nowrap;color:#000000;'
+            ) + extra_style + (f'background:{fill};' if fill else 'background:#FFFFFF;')
+            return f'<{tag} style="{style}">{_excel_cell_html(cell)}</{tag}>'
+
+        rows_html = []
+        header_cells = ''.join(
+            cell_tag('th', ws.cell(row=header_row, column=col)) for col in range(1, last_col + 1)
+        )
+        rows_html.append(f'<tr>{header_cells}</tr>')
+        for row_idx in data_rows:
+            cells = ''.join(cell_tag('td', ws.cell(row=row_idx, column=col)) for col in range(1, last_col + 1))
+            rows_html.append(f'<tr>{cells}</tr>')
+
+        title = _excel_cell_html(ws.cell(row=1, column=1))
+        return f"""
+        <div style="overflow-x:auto;">
+          <div style="background:#FFFFFF;color:#000000;padding:12px;border-radius:6px;display:inline-block;min-width:100%;box-sizing:border-box;">
+            <div style="text-align:center;font-family:'DFKai-SB','標楷體',serif;font-size:17px;margin-bottom:6px;">{title}</div>
+            <table style="border-collapse:collapse;margin:0 auto;font-family:'DFKai-SB','標楷體',serif;font-size:15px;">
+              {''.join(rows_html)}
+            </table>
+          </div>
+        </div>
+        """
+
+    def read_output_grids(output_bytes):
+        """
+        把輸出的 Excel 讀回來（每個排班頁籤一張），網頁上看到的就是 Excel 的內容。
+        回傳 (頁籤名, 文字表格 DataFrame, 跟 Excel 同樣上色的 HTML 表格)。
+        """
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(output_bytes), data_only=True, rich_text=True)
+        grids = []
+        for ws in wb.worksheets:
+            header_row = None
+            headers = []
+            for row_idx in range(1, 6):
+                values = [ws.cell(row=row_idx, column=col).value for col in range(1, ws.max_column + 1)]
+                if values and str(values[0] or '').strip() in ('主值', '副值'):
+                    header_row = row_idx
+                    headers = [str(value or '').strip() for value in values]
+                    break
+            if not header_row:
+                continue
+            while headers and not headers[-1]:
+                headers.pop()
+            duplicated = {h for h in headers if headers.count(h) > 1}
+            seen = {}
+            columns = []
+            for h in headers:
+                seen[h] = seen.get(h, 0) + 1
+                columns.append(f"{h}{seen[h]}" if h in duplicated else h)
             rows = []
-            for result in results.get('holiday_results', []):
-                rows.append({
-                    "班別": format_holiday_shift_result(result, month),
-                    "姓名": result.nurse.name,
-                    "欄位": result.slot.shift_name,
-                    "狀態": _status_tags(
-                        "下月" if result.slot.is_next_month else '',
-                        "補班" if result.is_makeup else '',
-                        "國假補償" if result.is_holiday_compensation else '',
-                        "跳過" if result.is_skipped else '',
-                        "定位點" if result.is_last_normal else '',
-                    ),
-                })
-            st.table(rows or [{"班別": "-", "姓名": "-", "欄位": "無資料", "狀態": "-"}])
+            data_rows = []
+            for row_idx in range(header_row + 1, ws.max_row + 1):
+                values = [ws.cell(row=row_idx, column=col).value for col in range(1, len(columns) + 1)]
+                if not values[0]:
+                    continue
+                data_rows.append(row_idx)
+                rows.append([str(v).replace('\n', ' ') if v is not None else '' for v in values])
+            grids.append((
+                ws.title.strip(),
+                pandas.DataFrame(rows, columns=columns),
+                _excel_table_html(ws, header_row, len(columns), data_rows),
+            ))
+        return grids
+
+    _LOG_SECTIONS = (
+        ('大夜班排班流程', '大夜'),
+        ('小夜班排班流程', '小夜週'),
+        ('假日班排班流程', '假日班'),
+    )
+    _LOG_PREFIXES = (
+        ('跳過 {name}:', '⏭️ 跳過：'),
+        ('補班暫不排 {name}:', '⏸️ 補班暫不排：'),
+        ('輪序回補: {name}', '🔁 補班：'),
+        ('隨輪序補班: {name}', '🔁 補班：'),
+        ('補班: {name}', '🔁 補班：'),
+        ('排班: {name}', '✅ 排到：'),
+        ('正常輪序: {name}', '✅ 排到：'),
+    )
+
+    def _friendly_log_line(line, name):
+        if line.startswith('['):
+            # 還班相關的結構化 log 轉成白話；其他 [除錯] 行不顯示
+            tag = line[1:line.find(']')] if ']' in line else ''
+            if '還班' not in tag and '補償' not in tag:
+                return None
+            if tag == '還班未還':
+                return '🎫 ' + line.split(']', 1)[1].replace(name, '').strip() + ' → 已寫入備註「還班未還」'
+            if tag == '還班尚未生效':
+                return '🎫 有還班，但這班還沒到生效日期，照常排班'
+            credit = re.search(r'credit=\d{4}-(\d{2})-(\d{2})', line)
+            slot = re.search(r'original_slot=([^\s（(]+)', line)
+            if not credit:
+                return None
+            text = f"🎫 用還班（補{int(credit.group(1))}/{int(credit.group(2))}）抵掉"
+            return text + (f" {slot.group(1)}" if slot else ' 這次輪值')
+        if "['" in line:
+            return None
+        line = line.lstrip('★ ').strip()
+        for prefix, label in _LOG_PREFIXES:
+            prefix = prefix.format(name=name)
+            if line.startswith(prefix):
+                return label + line[len(prefix):].strip(' :：')
+        return '・' + line
+
+    def explain_nurse(log_text, name):
+        """從排班 log 挑出跟這個人有關的行，依大夜 / 小夜週 / 假日班分組。"""
+        sections = {'讀取上月資料': [], '大夜': [], '小夜週': [], '假日班': []}
+        section = '讀取上月資料'
+        slot = ''
+        in_summary = False
+        for raw in (log_text or '').splitlines():
+            line = raw.strip()
+            for marker, label in _LOG_SECTIONS:
+                if marker in line:
+                    section, slot, in_summary = label, '', False
+            if line.startswith('=====') and '排班結果' in line:
+                in_summary = True  # 後面是結果預覽表，跟 Excel 重複
+                continue
+            if line.startswith('▶ 時段'):
+                slot = line.replace('▶ 時段', '').strip()
+                continue
+            if in_summary or name not in line:
+                continue
+            text = _friendly_log_line(line, name)
+            if not text:
+                continue
+            if section == '假日班' and slot and slot not in text:
+                text = f"**{slot}**　{text}"
+            if text not in sections[section]:
+                sections[section].append(text)
+        return sections
+
+    def render_nurse_explanation(sheet_label, row, log_text):
+        name = str(row.iloc[0]).lstrip('*').strip()
+        with st.container(border=True):
+            st.markdown(f"#### 🔍 {name}：為什麼這樣排？")
+            st.dataframe(pandas.DataFrame([row]), hide_index=True, width="stretch")
+            sections = explain_nurse(log_text, name)
+            shown = [(label, items) for label, items in sections.items() if items]
+            if not shown:
+                st.caption("這個人在本次排班沒有特別紀錄（沒有輪到或沒有被跳過）。")
+                return
+            cols = st.columns(len(shown))
+            for col, (label, items) in zip(cols, shown):
+                with col:
+                    st.markdown(f"**{label}**")
+                    st.markdown('\n'.join(f"- {item}" for item in items))
 
     def render_last_run():
         run = st.session_state.get('last_run')
         if not run:
             return
 
-        st.markdown("---")
-        st.success("✅ 排班完成！")
-
-        st.header("📥 下載結果")
+        st.subheader("③ 排班結果")
+        st.success(f"✅ 排班完成（{run.get('finished_at', '')}）")
         st.download_button(
-            label=f"下載結果 {run['output_filename']}",
+            label=f"⬇️ 下載 {run['output_filename']}",
             data=run['output_bytes'],
             file_name=run['output_filename'],
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1295,14 +1443,42 @@ if modules_loaded:
             use_container_width=True
         )
 
-        show_logs = st.checkbox("顯示詳細 log", value=False, key="show_logs")
-        log_container = st.expander("📝 排班詳細日誌", expanded=show_logs)
-        with log_container:
-            if show_logs:
-                log_text = run.get('log_text', '')
-                st.text(log_text[-5000:] if log_text else '')
-            else:
-                st.caption("勾選「顯示詳細 log」後顯示")
+        all_results = run.get('all_results') or {}
+        sheet_logs = run.get('sheet_logs') or {}
+        grids = read_output_grids(run['output_bytes'])
+        sheet_keys = list(all_results.keys())
+        if not grids:
+            return
+
+        tabs = st.tabs([title for title, _, _ in grids])
+        for idx, (tab, (title, grid, table_html)) in enumerate(zip(tabs, grids)):
+            sheet_key = sheet_keys[idx] if idx < len(sheet_keys) else None
+            with tab:
+                if sheet_key and all_results.get(sheet_key):
+                    notes = build_quality_notes(all_results[sheet_key])
+                    warnings = [msg for level, msg in notes if level in ('error', 'warning')]
+                    infos = [msg for level, msg in notes if level == 'info']
+                    for msg in warnings:
+                        st.warning(msg)
+                    if infos:
+                        st.caption('　'.join(f"ℹ️ {msg}" for msg in infos))
+                # 跟下載的 Excel 同樣上色（整張表一次顯示完，不用在表格內捲動）
+                st.markdown(table_html, unsafe_allow_html=True)
+
+                names = [str(name) for name in grid.iloc[:, 0]]
+                selected = st.selectbox(
+                    "🔍 選一位人員，看他這個月為什麼這樣排（跳過原因、補班、還班）",
+                    options=names,
+                    index=None,
+                    placeholder="選擇人員…",
+                    key=f"result_explain_{idx}",
+                )
+                if selected:
+                    render_nurse_explanation(title, grid.iloc[names.index(selected)], sheet_logs.get(sheet_key, ''))
+
+        with st.expander("📝 完整排班日誌（進階）", expanded=False):
+            log_text = run.get('log_text', '')
+            st.text(log_text[-20000:] if log_text else '')
 
     # ========== 側邊欄：國定假日設定 ==========
     with st.sidebar:
@@ -1454,34 +1630,217 @@ if modules_loaded:
 
     # ========== 主區域 ==========
 
-    # 檔案上傳區
-    st.header("📁 上傳值班表")
-    st.markdown("**上傳前請先確認**")
-    st.info(
-        "1. 需要補班的人，請在 Excel 的「補班」欄填「補」或「待補班」即可；不確定日期時不用先寫日期，系統會先找可補的空格。\n\n"
-        "2. 上傳後請看「排班前檢查」，確認大夜、小夜週、假日班的常規起頭人員是否正確；需要時可手動指定起頭。\n\n"
-        "3. 新增人員可直接接在 Excel 名單最下面一列；刪除人員請刪除整列，避免留下空白資料。\n\n"
-        "4. 請先檢查下個月假日班、大P、小P、換心、待命等資訊是否已填好，系統會依這些欄位判斷是否跳過或改補。"
-    )
+    def render_steps(stage):
+        labels = ['① 上傳本月值班表', '② 檢查 / 調整', '③ 排班並下載']
+        parts = []
+        for idx, label in enumerate(labels, 1):
+            if idx < stage:
+                parts.append(f"✅ {label}")
+            elif idx == stage:
+                parts.append(f"👉 **{label}**")
+            else:
+                parts.append(f"⚪ {label}")
+        st.markdown('　→　'.join(parts))
+
+    def render_health_check(sheet_names, pre_schedule_checks, year, holidays_missing):
+        """一張表看完每個頁籤的狀態，下面只列出「需要你處理」的事。"""
+        rows = []
+        todo = []
+        if holidays_missing:
+            todo.append(('error', f"尚未設定 {year} 年國定假日 → 請先在左側「國定假日設定」新增，否則國定假日不會排假日班。"))
+
+        approved = st.session_state.approved_return_credits
+        for sheet_name in sheet_names:
+            check = pre_schedule_checks.get(sheet_name)
+            if not check:
+                todo.append(('error', f"{sheet_name.strip()}：讀取失敗，請確認 Excel 格式。"))
+                continue
+            nurses = check.get('nurses') or []
+            label = sheet_name.strip()
+            anchors = get_manual_anchor_overrides(sheet_name)
+            pending = sum(
+                len(getattr(nurse, attr, []))
+                for nurse in nurses
+                for attr in ('pending_night_makeup', 'pending_small_night_makeup', 'pending_holiday_makeup')
+            )
+            candidates = get_return_credit_candidates(sheet_name, check)
+            waiting = [c for c in candidates if c.credit_id not in approved]
+            approved_count = sum(1 for c in approved.values() if c.sheet_name == sheet_name)
+
+            rows.append({
+                '頁籤': label,
+                '人數': len(nurses),
+                '大夜從': anchors.get('night') or check.get('next_night') or '名單第一位',
+                '小夜週從': anchors.get('small_night') or check.get('next_small_night') or '名單第一位',
+                '假日班從': anchors.get('holiday') or check.get('next_holiday') or '名單第一位',
+                '待補班': f"{pending} 筆" if pending else '-',
+                '還班': (f"{approved_count} 已核准" if approved_count else '-') + (f"／{len(waiting)} 待核准" if waiting else ''),
+            })
+
+            if waiting:
+                names = '、'.join(sorted({c.nurse_name for c in waiting}))
+                todo.append(('warning', f"{label}：{names} 有上月還班尚未核准 → 到「🎫 還班」分頁勾選，不核准就不會套用。"))
+            missing_previous = [n.name for n in nurses if n.name not in (check.get('previous_entries') or {})]
+            if missing_previous:
+                todo.append(('warning', f"{label}：{'、'.join(missing_previous)} 沒有讀到大夜 / 小夜週等欄位資料，請確認 Excel。"))
+            for key, shift_label, anchor_key in (
+                ('last_night', '大夜', 'night'),
+                ('last_small_night', '小夜週', 'small_night'),
+                ('last_holiday', '假日班', 'holiday'),
+            ):
+                if not check.get(key) and not anchors.get(anchor_key):
+                    todo.append(('warning', f"{label}：找不到上月{shift_label}最後一位，會從名單第一位開始 → 可到「🔁 補班與起頭」指定。"))
+
+        st.dataframe(pandas.DataFrame(rows), hide_index=True, width="stretch", height="content")
+        st.caption("「大夜從 / 小夜週從 / 假日班從」＝本月常規輪序的第一位；「待補班」已自動排入補班清單。")
+        if todo:
+            st.markdown("**需要你處理：**")
+            for level, msg in todo:
+                (st.error if level == 'error' else st.warning)(msg)
+        else:
+            st.success("沒有需要處理的項目，可以直接按「🚀 開始排班」。")
+
+    def run_schedule(tmp_path, sheet_names, pre_schedule_checks, year, month, roc_year, include_pre_check_sheet):
+        import copy
+
+        year_str = str(year)
+        config.HOLIDAYS_2026 = st.session_state.all_holidays.get(year_str, {})
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        all_results = {}
+        sheet_logs = {}
+        total_sheets = len(sheet_names)
+
+        for idx, sheet_name in enumerate(sheet_names):
+            status_text.text(f"正在處理: {sheet_name} ({idx + 1}/{total_sheets})")
+            progress_bar.progress((idx + 1) / (total_sheets + 1))
+            pre_schedule_check = pre_schedule_checks.get(sheet_name) or build_pre_schedule_check(
+                tmp_path, sheet_name, year, month,
+            )
+            manual_anchor_overrides = get_manual_anchor_overrides(sheet_name)
+            manual_past_makeup_entries = get_manual_past_makeup_entries(sheet_name)
+            manual_shift_entries = get_manual_shift_entries(sheet_name)
+            priority_makeup_entries = get_priority_makeup_entries(sheet_name)
+            extra_makeup_entries = (
+                get_extra_makeup_entries(sheet_name)
+                + manual_makeup_entries_to_extra(manual_past_makeup_entries)
+            )
+            manual_makeup_note = st.session_state.get(_makeup_note_key(sheet_name), '').strip()
+            pre_schedule_check['manual_makeup_note'] = manual_makeup_note
+            # 排班會把用掉的還班標成 consumed；傳副本進去，重按「開始排班」時已核准的還班才不會失效。
+            approved_credits = copy.deepcopy(list(st.session_state.approved_return_credits.values()))
+
+            sheet_output = io.StringIO()
+            with redirect_stdout(sheet_output):
+                try:
+                    (
+                        nurses,
+                        night_results,
+                        small_night_results,
+                        holiday_results,
+                        extra_makeup_results,
+                        night_last_normal,
+                        small_night_last_normal,
+                        holiday_last_normal,
+                        night_identity_skipped,
+                        small_night_identity_skipped,
+                    ) = process_sheet(
+                        tmp_path,
+                        sheet_name,
+                        year,
+                        month,
+                        regular_start_night_name=manual_anchor_overrides.get('night'),
+                        regular_start_small_night_name=manual_anchor_overrides.get('small_night'),
+                        regular_start_holiday_name=manual_anchor_overrides.get('holiday'),
+                        manual_shift_entries=manual_shift_entries,
+                        priority_makeup_entries=priority_makeup_entries,
+                        extra_makeup_entries=extra_makeup_entries,
+                        manual_makeup_note=manual_makeup_note,
+                        approved_return_credits=approved_credits,
+                    )
+                    all_results[sheet_name] = {
+                        'nurses': nurses,
+                        'night_results': night_results,
+                        'small_night_results': small_night_results,
+                        'holiday_results': holiday_results,
+                        'extra_makeup_results': extra_makeup_results,
+                        'night_last_normal': night_last_normal,
+                        'small_night_last_normal': small_night_last_normal,
+                        'holiday_last_normal': holiday_last_normal,
+                        'night_identity_skipped': night_identity_skipped,
+                        'small_night_identity_skipped': small_night_identity_skipped,
+                        'pre_schedule_check': pre_schedule_check if include_pre_check_sheet else None,
+                        'manual_anchor_overrides': manual_anchor_overrides,
+                        'manual_shift_entries': manual_shift_entries,
+                        'priority_makeup_entries': priority_makeup_entries,
+                        'extra_makeup_entries': extra_makeup_entries,
+                        'manual_makeup_note': manual_makeup_note,
+                    }
+                except Exception as e:
+                    import traceback
+                    st.error(f"處理頁籤 {sheet_name} 時發生錯誤: {e}")
+                    st.code(traceback.format_exc())
+            sheet_logs[sheet_name] = sheet_output.getvalue()
+
+        # 產生輸出檔案前做稽核；有問題就停止輸出。
+        from schedule_validation import validate_schedule_results
+        validation_errors = validate_schedule_results(all_results, year, month)
+        if validation_errors:
+            status_text.text("⛔ 排班稽核未通過，已停止輸出")
+            st.error("發現排班衝突：\n\n" + "\n\n".join(f"- {item}" for item in validation_errors))
+            return
+
+        status_text.text("正在產生排班結果...")
+        progress_bar.progress(0.9)
+        output_filename = f"排班結果_{roc_year}年{month}月.xlsx"
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as output_tmp:
+            output_path = output_tmp.name
+        title = f"臺北榮民總醫院護理部思源手術室{roc_year}年{month}月值班表"
+        create_schedule_excel_multi_sheet(output_path, title, all_results, year, month)
+        with open(output_path, 'rb') as f:
+            output_bytes = f.read()
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+
+        progress_bar.empty()
+        status_text.empty()
+        st.session_state.last_run = {
+            'all_results': all_results,
+            'output_bytes': output_bytes,
+            'output_filename': output_filename,
+            'log_text': '\n'.join(sheet_logs.values()),
+            'sheet_logs': sheet_logs,
+            'month': month,
+            'finished_at': datetime.now().strftime('%H:%M:%S'),
+        }
+
+    steps_placeholder = st.empty()
+
+    st.subheader("① 上傳本月值班表")
+    with st.expander("第一次使用？上傳前請確認這 4 點", expanded=False):
+        st.markdown(
+            "1. 需要補班的人，在要補的那一格（大夜、小夜週或假日欄）填「補」即可，不用寫日期。\n"
+            "2. 新增人員接在名單最下面；刪除人員請刪整列，不要留空白列。\n"
+            "3. 下個月的大P / 小P / 換心 / 待命、公休、婚假都要先填好，系統靠這些判斷跳過或改補。\n"
+            "4. 左側「國定假日設定」要有排班那一年的假日。"
+        )
     uploaded_file = st.file_uploader(
-        "選擇 Excel 檔案",
+        "選擇 Excel 檔案（系統會排出「下個月」的班）",
         type=['xlsx', 'xls'],
-        help="請上傳包含護理人員資料的值班表 Excel 檔案"
     )
 
+    stage = 1
     if uploaded_file is not None:
-        # 檔案簽章：用來判斷是不是同一份上傳（Streamlit 每動一個元件都會整頁重跑，
-        # 若每次都重寫暫存檔、重新解析 Excel，會導致光是改一個設定就要跑很久）
+        # 檔案簽章：同一份上傳只寫一次暫存檔、只建立一次排班前檢查；
+        # 之後點任何設定造成的整頁重跑都直接沿用，不重新解析 Excel。
         file_signature = (uploaded_file.name, uploaded_file.size, getattr(uploaded_file, 'file_id', None))
 
         if st.session_state.get('_uploaded_file_signature') != file_signature:
-            # 真的是新上傳的檔案，才需要重寫暫存檔並清掉舊的排班前檢查快取。
-            # 注意順序：先寫好新檔、更新 session_state，最後才刪舊檔——
-            # 因為 Streamlit 的重跑可能在中途被下一次互動打斷，若先刪舊檔
-            # 才更新 session_state，一旦跑到一半被打斷，session_state 就會
-            # 卡在指向一個已經被刪除的暫存檔，下次重跑就會 FileNotFoundError。
+            # 先寫好新檔、更新 session_state，最後才刪舊檔，避免重跑中途被打斷時指向已刪除的檔案。
             old_tmp_path = st.session_state.get('_uploaded_tmp_path')
-
             with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
                 tmp_file.write(uploaded_file.getvalue())
                 tmp_path = tmp_file.name
@@ -1490,9 +1849,10 @@ if modules_loaded:
             st.session_state['_uploaded_tmp_path'] = tmp_path
             st.session_state['_pre_schedule_checks'] = None
             st.session_state['_pre_schedule_checks_key'] = None
-            # 換了一份新檔案，上一份檔案核准的還班/候選狀態就不該沿用，全部清空重解析。
+            # 換了一份新檔案：上一份的還班核准、候選、排班結果都不沿用。
             st.session_state.approved_return_credits = {}
             st.session_state.detected_return_credit_candidates = {}
+            st.session_state.pop('last_run', None)
 
             if old_tmp_path and old_tmp_path != tmp_path and os.path.exists(old_tmp_path):
                 try:
@@ -1500,8 +1860,6 @@ if modules_loaded:
                 except OSError:
                     pass
         else:
-            # 同一份檔案，重跑只是因為其他元件被點擊，直接沿用暫存檔，不重寫。
-            # 若暫存檔意外不見了（例如系統清過 Temp），自動重寫一份，不要整頁報錯。
             tmp_path = st.session_state['_uploaded_tmp_path']
             if not os.path.exists(tmp_path):
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
@@ -1512,68 +1870,32 @@ if modules_loaded:
                 st.session_state['_pre_schedule_checks_key'] = None
 
         try:
-            # 解析年月
             roc_year, input_month = parse_title_year_month(tmp_path)
 
             if roc_year is None or input_month is None:
-                st.error("❌ 無法從 Excel 標題解析年份和月份")
-                st.info("請確認標題格式為: XXX年X月值班表")
+                st.error("❌ 無法從 Excel 標題解析年份和月份，請確認標題格式為：XXX年X月值班表")
             else:
-                # 計算目標月份：上傳本月值班表，系統產生下個月排班表
+                # 上傳本月值班表，系統產生下個月排班表
                 if input_month == 12:
                     month = 1
-                    year = roc_to_western_year(roc_year) + 1
                     roc_year += 1
                 else:
                     month = input_month + 1
-                    year = roc_to_western_year(roc_year)
-
                 year = roc_to_western_year(roc_year)
 
-                # 檢查對應年份的國定假日設定
-                year_str = str(year)
-                holidays_for_year = st.session_state.all_holidays.get(year_str)
-                # 排班前檢查（含大夜欄國假還班偵測）也要用目標年份的國定假日。
+                holidays_for_year = st.session_state.all_holidays.get(str(year))
                 config.HOLIDAYS_2026 = holidays_for_year or {}
                 config.HOLIDAYS_BY_YEAR = st.session_state.all_holidays
-                month_holidays = {}
-                holiday_metric_text = '未設定'
-                if holidays_for_year is not None:
-                    month_holidays = {
-                        k: v for k, v in holidays_for_year.items()
-                        if int(k.split('/')[0]) == month
-                    }
-                    if month_holidays:
-                        holiday_metric_text = '、'.join([
-                            f"{k}({v})" for k, v in sorted(
-                                month_holidays.items(),
-                                key=lambda x: int(x[0].split('/')[1])
-                            )
-                        ])
-                    else:
-                        holiday_metric_text = '無'
-
-                # 顯示檔案資訊
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("📅 民國年", f"{roc_year} 年")
-                with col2:
-                    st.metric("📆 月份", f"{month} 月")
-                with col3:
-                    st.metric("🎌 國定假日", holiday_metric_text)
-
-                # 取得頁籤
-                sheet_names = get_sheet_names(tmp_path)
-                st.info(f"📑 找到 {len(sheet_names)} 個頁籤: {', '.join(sheet_names)}")
-
+                month_holidays = sorted(
+                    ((k, v) for k, v in (holidays_for_year or {}).items() if int(k.split('/')[0]) == month),
+                    key=lambda x: int(x[0].split('/')[1]),
+                )
+                holiday_text = '、'.join(f"{k} {v}" for k, v in month_holidays) or '無'
                 if holidays_for_year is None:
-                    st.warning(f"⚠️ 尚未設定 {year} 年的國定假日，請在左側新增")
+                    holiday_text = '⚠️ 未設定'
 
-                st.markdown("---")
+                sheet_names = get_sheet_names(tmp_path)
 
-                # 排班前檢查很吃重（每個頁籤要重讀好幾次 Excel），
-                # 用 session_state 快取，同一份檔案只在第一次算，
-                # 之後只是切換其他設定造成整頁重跑時直接沿用結果。
                 pre_schedule_checks_key = (tmp_path, year, month, tuple(sheet_names))
                 if (
                     st.session_state.get('_pre_schedule_checks') is not None
@@ -1582,190 +1904,56 @@ if modules_loaded:
                     pre_schedule_checks = st.session_state['_pre_schedule_checks']
                 else:
                     pre_schedule_checks = {}
-                    with st.spinner("正在建立排班前檢查..."):
+                    with st.spinner("正在讀取值班表..."):
                         for sheet_name in sheet_names:
                             try:
                                 pre_schedule_checks[sheet_name] = build_pre_schedule_check(
-                                    tmp_path,
-                                    sheet_name,
-                                    year,
-                                    month,
+                                    tmp_path, sheet_name, year, month,
                                 )
                             except Exception as e:
-                                st.error(f"建立 {sheet_name} 排班前檢查時發生錯誤: {e}")
+                                st.error(f"讀取 {sheet_name} 時發生錯誤: {e}")
                     st.session_state['_pre_schedule_checks'] = pre_schedule_checks
                     st.session_state['_pre_schedule_checks_key'] = pre_schedule_checks_key
 
-                if pre_schedule_checks:
-                    render_pre_schedule_checks(pre_schedule_checks)
+                stage = 3 if st.session_state.get('last_run') else 2
+                st.subheader(f"② 檢查 / 調整：排 {roc_year} 年 {month} 月")
+                st.markdown(f"🎌 本月國定假日：{holiday_text}")
 
-                st.markdown("---")
+                check_tab, makeup_tab, credit_tab = st.tabs(["✅ 檢查摘要", "🔁 補班與起頭", "🎫 還班"])
+                with check_tab:
+                    render_health_check(sheet_names, pre_schedule_checks, year, holidays_for_year is None)
+                with makeup_tab:
+                    if pre_schedule_checks:
+                        render_pre_schedule_checks(pre_schedule_checks)
+                with credit_tab:
+                    if pre_schedule_checks:
+                        render_return_credit_section(sheet_names, pre_schedule_checks)
 
-                if pre_schedule_checks:
-                    render_return_credit_section(sheet_names, pre_schedule_checks)
-
-                st.markdown("---")
-
-                include_pre_check_sheet = st.checkbox(
-                    "下載結果包含「排班前核對」頁籤", value=False, key="include_pre_check_sheet"
-                )
-
-                # 排班按鈕
-                if st.button("🚀 開始排班", type="primary", use_container_width=True):
-
-                    # 🔴 關鍵：動態更新 config 模組的假日設定
-                    year_str = str(year)
-                    if year_str in st.session_state.all_holidays:
-                        config.HOLIDAYS_2026 = st.session_state.all_holidays[year_str]
-                    else:
-                        config.HOLIDAYS_2026 = {}
-                        st.warning("⚠️ 使用空的國定假日設定")
-
-                    # 建立進度條和狀態
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-
-                    # 用於捕捉輸出的區域
-                    log_container = st.container()
-
-                    all_results = {}
-                    total_sheets = len(sheet_names)
-
-                    # 捕捉 print 輸出
-                    log_output = io.StringIO()
-
-                    with log_container:
-                        for idx, sheet_name in enumerate(sheet_names):
-                            status_text.text(f"正在處理: {sheet_name} ({idx + 1}/{total_sheets})")
-                            progress_bar.progress((idx + 1) / (total_sheets + 1))
-                            pre_schedule_check = pre_schedule_checks.get(sheet_name) or build_pre_schedule_check(
-                                tmp_path,
-                                sheet_name,
-                                year,
-                                month,
-                            )
-                            manual_anchor_overrides = get_manual_anchor_overrides(sheet_name)
-                            manual_past_makeup_entries = get_manual_past_makeup_entries(sheet_name)
-                            manual_shift_entries = get_manual_shift_entries(sheet_name)
-                            priority_makeup_entries = get_priority_makeup_entries(sheet_name)
-                            extra_makeup_entries = (
-                                get_extra_makeup_entries(sheet_name)
-                                + manual_makeup_entries_to_extra(manual_past_makeup_entries)
-                            )
-                            manual_makeup_note = st.session_state.get(_makeup_note_key(sheet_name), '').strip()
-                            pre_schedule_check['manual_makeup_note'] = manual_makeup_note
-
-                            # 捕捉這個頁籤的輸出
-                            sheet_output = io.StringIO()
-                            with redirect_stdout(sheet_output):
-                                try:
-                                    (
-                                        nurses,
-                                        night_results,
-                                        small_night_results,
-                                        holiday_results,
-                                        extra_makeup_results,
-                                        night_last_normal,
-                                        small_night_last_normal,
-                                        holiday_last_normal,
-                                        night_identity_skipped,
-                                        small_night_identity_skipped,
-                                    ) = process_sheet(
-                                        tmp_path,
-                                        sheet_name,
-                                        year,
-                                        month,
-                                        regular_start_night_name=manual_anchor_overrides.get('night'),
-                                        regular_start_small_night_name=manual_anchor_overrides.get('small_night'),
-                                        regular_start_holiday_name=manual_anchor_overrides.get('holiday'),
-                                        manual_shift_entries=manual_shift_entries,
-                                        priority_makeup_entries=priority_makeup_entries,
-                                        extra_makeup_entries=extra_makeup_entries,
-                                        manual_makeup_note=manual_makeup_note,
-                                        approved_return_credits=list(st.session_state.approved_return_credits.values()),
-                                    )
-
-                                    all_results[sheet_name] = {
-                                        'nurses': nurses,
-                                        'night_results': night_results,
-                                        'small_night_results': small_night_results,
-                                        'holiday_results': holiday_results,
-                                        'extra_makeup_results': extra_makeup_results,
-                                        'night_last_normal': night_last_normal,
-                                        'small_night_last_normal': small_night_last_normal,
-                                        'holiday_last_normal': holiday_last_normal,
-                                        'night_identity_skipped': night_identity_skipped,
-                                        'small_night_identity_skipped': small_night_identity_skipped,
-                                        'pre_schedule_check': pre_schedule_check if include_pre_check_sheet else None,
-                                        'manual_anchor_overrides': manual_anchor_overrides,
-                                        'manual_shift_entries': manual_shift_entries,
-                                        'priority_makeup_entries': priority_makeup_entries,
-                                        'extra_makeup_entries': extra_makeup_entries,
-                                        'manual_makeup_note': manual_makeup_note,
-                                    }
-                                except Exception as e:
-                                    st.error(f"處理頁籤 {sheet_name} 時發生錯誤: {e}")
-                                    import traceback
-                                    st.code(traceback.format_exc())
-                                    continue
-
-                            # 顯示這個頁籤的輸出
-                            output_text = sheet_output.getvalue()
-                            if False:
-                                st.text(output_text[-5000:])
-                            log_output.write(output_text)
-
-                    # 產生輸出檔案前做靜默稽核；只在有問題時顯示並停止輸出。
-                    from schedule_validation import validate_schedule_results
-                    validation_errors = validate_schedule_results(all_results, year, month)
-                    if validation_errors:
-                        status_text.text("⛔ 排班稽核未通過，已停止輸出")
-                        st.error("發現排班衝突：\n\n" + "\n\n".join(f"- {item}" for item in validation_errors))
-                        st.stop()
-
-                    status_text.text("正在產生排班結果...")
-                    progress_bar.progress(0.9)
-
-                    # 使用臨時檔案儲存結果
-                    output_filename = f"排班結果_{roc_year}年{month}月.xlsx"
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as output_tmp:
-                        output_path = output_tmp.name
-
-                    title = f"臺北榮民總醫院護理部思源手術室{roc_year}年{month}月值班表"
-                    create_schedule_excel_multi_sheet(output_path, title, all_results, year, month)
-
-                    progress_bar.progress(1.0)
-                    status_text.empty()
-
-                    with open(output_path, 'rb') as f:
-                        output_bytes = f.read()
-
-                    st.session_state.last_run = {
-                        'all_results': all_results,
-                        'output_bytes': output_bytes,
-                        'output_filename': output_filename,
-                        'log_text': log_output.getvalue(),
-                        'month': month,
-                    }
-
-                    # 清理臨時輸出檔案
-                    try:
-                        os.unlink(output_path)
-                    except:
-                        pass
+                run_col, option_col = st.columns([3, 1])
+                with option_col:
+                    include_pre_check_sheet = st.checkbox(
+                        "Excel 附「排班前核對」頁", value=False, key="include_pre_check_sheet"
+                    )
+                with run_col:
+                    clicked = st.button(
+                        "🔄 重新排班" if st.session_state.get('last_run') else "🚀 開始排班",
+                        type="primary",
+                        use_container_width=True,
+                    )
+                if clicked:
+                    st.session_state.pop('last_run', None)
+                    run_schedule(tmp_path, sheet_names, pre_schedule_checks, year, month, roc_year, include_pre_check_sheet)
+                    if st.session_state.get('last_run'):
+                        st.rerun()  # 重畫一次，讓步驟列、按鈕文字和結果一致
 
         except Exception as e:
             st.error(f"❌ 處理檔案時發生錯誤: {e}")
             import traceback
             st.code(traceback.format_exc())
 
-        finally:
-            # 清理臨時上傳檔案
-            try:
-                os.unlink(tmp_path)
-            except:
-                pass
-
         if st.session_state.get('last_run'):
+            st.markdown("---")
             render_last_run()
 
+    with steps_placeholder.container():
+        render_steps(stage)

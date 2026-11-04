@@ -1133,6 +1133,7 @@ def schedule_holiday_shifts(
         all_slots.sort(key=lambda slot: (slot.date, slot_order.get(slot.shift_type_id, 99)))
     
     for slot in all_slots:
+        print(f"▶ 時段 {slot.display_text}")  # 網頁「為什麼這樣排」用來標示下面幾行屬於哪個時段
 
         # 0. 先檢查這個時段是否被跨月補班佔用
         # 護理長已在上個月班表中手動確認這個班，直接佔位，不做任何衝突檢查

@@ -338,6 +338,7 @@ def get_return_credit_candidates_from_nurses(
     nurses: List[NurseInfo],
     target_year: int = None,
     target_month: int = None,
+    previous_entries: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> List[ReturnCredit]:
     """
     從已解析的護理人員清單找出「上月結轉」還班候選（source='carry_over_detected'）。
@@ -369,6 +370,13 @@ def get_return_credit_candidates_from_nurses(
     candidates: List[ReturnCredit] = []
     for nurse in nurses:
         seen_dates = set()
+        # 上月假日欄已寫「補1/1(原1/9小夜)」＝這筆還班上個月已經用掉，不再列為候選
+        # （跨月保留的大夜/小夜週，例如 12/31.1/1.1/2 (1/1)，下個月會再讀到一次）
+        holiday_text = ((previous_entries or {}).get(nurse.name) or {}).get('holiday', '')
+
+        def already_used(day):
+            return re.search(rf'補{day.month}/{day.day}(?!\d)\s*\(?原', holiday_text) is not None
+
         for source_type, dates in (
             ('大夜', nurse.night_shift_holiday_compensations),
             ('小夜', nurse.small_night_shift_holiday_compensations),
@@ -377,6 +385,9 @@ def get_return_credit_candidates_from_nurses(
                 day = d.date() if hasattr(d, 'date') else d
                 if prev_month is not None and not (day.month == prev_month and day.year == prev_year):
                     print(f"[上月結轉候選-過濾] sheet={sheet_name} nurse={nurse.name} source_date={day} 不在上個月，略過")
+                    continue
+                if already_used(day):
+                    print(f"[上月結轉候選-已使用] sheet={sheet_name} nurse={nurse.name} source_date={day} 上月假日欄已還，略過")
                     continue
                 dedupe_key = (day, source_type)
                 if dedupe_key in seen_dates:
