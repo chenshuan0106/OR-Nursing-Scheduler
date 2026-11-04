@@ -512,6 +512,8 @@ def check_night_shift_conflict(
     2. 大夜班包含週六時，同週末的週日假日班不能排（避免六日都上班）
     3. 假日班是小夜或大夜時，隔天有大夜班也衝突
        （因為隔天的大夜實際上是假日班當天晚上 11 點開始）
+    4. 大夜週的前一天（第一班大夜當晚 11 點上班）若排假日班，只能排大夜，
+       不能排白班或小夜
     """
     if not nurse.night_shift_dates:
         return False, ''
@@ -525,6 +527,23 @@ def check_night_shift_conflict(
     # 檢查 1: 當天或前一天有大夜班
     if slot_date in night_date_set or day_before in night_date_set:
         return True, '平日大夜衝突'
+
+    # 檢查 4: 大夜週前後一天只能排大夜
+    # 例如：大夜週 1/18-1/20（1/17 晚上 11 點開始），1/17 假日只能排大夜，不能排白班/小夜
+    # （大夜週後一天已由檢查 1 整天擋掉）
+    if slot.shift_name != '大夜':
+        for night_group in _group_consecutive_dates(nurse.night_shift_dates):
+            first_night = min(night_group)
+            last_night = max(night_group)
+            edge_days = {
+                (first_night - timedelta(days=1)).date(),
+                (last_night + timedelta(days=1)).date(),
+            }
+            if slot_date in edge_days:
+                return True, (
+                    f'大夜週({first_night.month}/{first_night.day}-{last_night.month}/{last_night.day})'
+                    f'前後只能排大夜'
+                )
 
     # 檢查 2: 如果假日班是週日，檢查同週末的週六是否有大夜班
     if slot.weekday == 6:  # 週日
@@ -1169,7 +1188,8 @@ def schedule_holiday_shifts(
 
         # 2. 上月帶來的「X月補」優先補班：固定跨月日期班排完後，先找第一個不衝突的格子
         if pending_priority_queue:
-            for pending_idx, (nurse_idx, column_index, original_text, target_date, target_slot_type, target_shift_type, is_manual) in enumerate(list(pending_priority_queue)):
+            for pending_entry in list(pending_priority_queue):
+                nurse_idx, column_index, original_text, target_date, target_slot_type, target_shift_type, is_manual = pending_entry
                 if target_date:
                     if slot.date.date() != target_date.date():
                         continue
@@ -1202,7 +1222,7 @@ def schedule_holiday_shifts(
                             return_credit_date=used_credit.source_date,
                             return_credit_id=used_credit.credit_id,
                         ))
-                        pending_priority_queue.pop(pending_idx)
+                        pending_priority_queue[:] = [e for e in pending_priority_queue if e is not pending_entry]
                         tag = '本月國假自動補償' if used_credit.source == 'current_month_auto' else '還班蓋過補班'
                         print(
                             f"  [{tag}] nurse={nurse.name} credit={used_credit.source_date.date()} "
@@ -1216,7 +1236,7 @@ def schedule_holiday_shifts(
                         is_makeup=True,
                         original_slot_text=original_text,
                     ))
-                    pending_priority_queue.pop(pending_idx)
+                    pending_priority_queue[:] = [e for e in pending_priority_queue if e is not pending_entry]
                     force_text = "手動指定" if is_manual else "優先補班"
                     print(f"  ★ {force_text}: {nurse.name} {slot.display_text} (原{original_text}) [欄{column_index}]")
                     assigned = True
@@ -1265,7 +1285,8 @@ def schedule_holiday_shifts(
                 assigned = True
                 continue
 
-        for queued_idx, (mq_idx, mq_slot, mq_adj, _mq_had, mq_cyc) in enumerate(list(makeup_queue)):
+        for queued_entry in list(makeup_queue):
+            mq_idx, mq_slot, mq_adj, _mq_had, mq_cyc = queued_entry
             nurse = nurses[mq_idx]
             if mq_adj == 'day_only' and slot.shift_name != '白班':
                 continue
@@ -1303,7 +1324,7 @@ def schedule_holiday_shifts(
                     return_credit_date=used_credit.source_date,
                     return_credit_id=used_credit.credit_id,
                 ))
-                makeup_queue.pop(queued_idx)
+                makeup_queue[:] = [e for e in makeup_queue if e is not queued_entry]
                 tag = '本月國假自動補償' if used_credit.source == 'current_month_auto' else '還班蓋過補班'
                 print(
                     f"  [{tag}] nurse={nurse.name} credit={used_credit.source_date.date()} "
@@ -1317,7 +1338,7 @@ def schedule_holiday_shifts(
                 is_makeup=True,
                 original_slot_text=original_text,
             ))
-            makeup_queue.pop(queued_idx)
+            makeup_queue[:] = [e for e in makeup_queue if e is not queued_entry]
             print(f"  輪序回補: {nurse.name} {slot.display_text} (原 {original_text})")
             assigned = True
             break
@@ -1509,14 +1530,14 @@ def schedule_holiday_shifts(
             else:
                 print(f"  跳過 {nurse.name}: {skip_info.reason}")
 
-                # 直接跳過不用補。P/換心保留文字提醒；公休/婚假以 '-' 標記。
+                # 直接跳過不用補。P/換心保留文字提醒；公休/婚假顯示「公休(原X/X班)」。
                 if not skip_info.need_find_next:
                     result = HolidayShiftResult(
                         slot=slot,
                         nurse=nurse,
                         column_index=cycle + ROTATION_COLUMN_OFFSET,
                         is_skipped=True,
-                        skip_reason='-' if skip_info.reason in ['公休', '婚假'] else skip_info.reason,
+                        skip_reason=skip_info.reason,
                     )
                     results.append(result)
 
@@ -1615,6 +1636,26 @@ def schedule_holiday_shifts(
             continue
         occupied_slots.add(slot_key)
         unique_results.append(result)
+
+    # 還班結算：記錄本月用掉 / 沒用掉的還班，輸出時寫進備註。
+    # current_month_auto 不寫：下個月會從大夜/小夜週欄的 (X/X) 重新偵測，寫了會重複。
+    nurse_by_name = {nurse.name: nurse for nurse in nurses}
+    for credit in all_return_credits:
+        if credit.sheet_name != sheet_name or credit.source == 'current_month_auto':
+            continue
+        nurse = nurse_by_name.get(credit.nurse_name)
+        if nurse is None or not credit.approved:
+            continue
+        if credit.consumed:
+            nurse.returned_credit_dates.append(credit.source_date)
+            continue
+        skip, reason = should_skip_for_p_shift(nurse, target_month)
+        if not skip and getattr(nurse, 'is_standby', {}).get(f'{target_month}月'):
+            skip, reason = True, f'{target_month}月待命'
+        if not skip:
+            reason = f'{target_month}月未輪到'
+        nurse.unreturned_return_credits.append({'source_date': credit.source_date, 'reason': reason})
+        print(f"  [還班未還] {nurse.name} 補{credit.source_date.month}/{credit.source_date.day}（{reason}）")
 
     return unique_results, last_normal_assigned_name
 

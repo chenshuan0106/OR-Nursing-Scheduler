@@ -1162,7 +1162,13 @@ def _write_schedule_sheet(
                     remarks_text = re.sub(pattern, '', remarks_text, flags=re.IGNORECASE)
                     # 移除多餘的換行和空白
                     remarks_text = re.sub(r'\n\s*\n', '\n', remarks_text).strip()
-        
+
+        # 上月備註的「還班未還」本月已還掉 → 從備註移除
+        for returned_date in nurse.returned_credit_dates:
+            pattern = rf'還班未還[:：]\s*補{returned_date.month}/{returned_date.day}(?!\d)[^\n]*'
+            remarks_text = re.sub(pattern, '', remarks_text)
+            remarks_text = re.sub(r'\n\s*\n', '\n', remarks_text).strip()
+
         remarks_parts = []
         if remarks_text.strip():
             remarks_parts.append(remarks_text.strip())
@@ -1174,7 +1180,16 @@ def _write_schedule_sheet(
                 last_date = max(makeup['dates'])
                 date_range = f"{first_date.month}/{first_date.day}-{last_date.month}/{last_date.day}"
                 remarks_parts.append(f"待補班:{date_range}{makeup['shift_type']}")
-        
+
+        # 本月沒用掉的還班（例如整月 P 班/換心輪不到）→ 備註欠還班，下月再還
+        for credit in nurse.unreturned_return_credits:
+            source_date = credit['source_date']
+            if re.search(rf'還班未還[:：]\s*補{source_date.month}/{source_date.day}(?!\d)', remarks_text):
+                continue  # 上月備註已經寫過，保留原文即可
+            remarks_parts.append(
+                f"還班未還:補{source_date.month}/{source_date.day}({credit['reason']}，欠1個還班)"
+            )
+
         final_remarks_text = '\n'.join(remarks_parts) if remarks_parts else ''
         green_font = Font(name='標楷體', color=COLORS['p_shift_green'])
         
@@ -1556,8 +1571,8 @@ def read_cross_month_makeup_holidays_from_excel(
 
             text = str(cell_value).strip()
 
-            # 上月表第一個假日欄若已標示「-」，代表這個月左表第一格要保留為空班。
-            if text == '-' and col_pos == 1:
+            # 上月表第一個假日欄若已標示「-」或「公休/婚假(原X/X班)」，代表這個月左表第一格要保留為空班。
+            if col_pos == 1 and (text == '-' or text.startswith('公休') or text.startswith('婚假')):
                 if name not in nurse_makeups:
                     nurse_makeups[name] = []
                 nurse_makeups[name].append({

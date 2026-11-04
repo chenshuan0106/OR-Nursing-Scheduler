@@ -321,7 +321,10 @@ def parse_nurse_info_from_row(
     if leave_value and leave_value != 'nan':
         field_values.append(leave_value)
     if remark_value and remark_value != 'nan':
-        field_values.append(remark_value)
+        # 「還班未還:補12/25(1月換心，欠1個還班)」是還班紀錄，不是公休日期或身分
+        remark_for_fields = re.sub(r'還班未還[:：][^\n]*', '', remark_value).strip()
+        if remark_for_fields:
+            field_values.append(remark_for_fields)
     if nurse.makeup_text and nurse.makeup_text != 'nan':
         field_values.append(nurse.makeup_text)
 

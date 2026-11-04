@@ -393,6 +393,32 @@ def get_return_credit_candidates_from_nurses(
                     approved=False,
                 ))
                 print(f"[上月結轉候選] sheet={sheet_name} nurse={nurse.name} source_date={day} source_type={source_type}")
+
+        # 備註欄「還班未還:補12/25(...)」：之前沒還掉的還班（例如整月 P 班/換心），
+        # 不受「只看上個月」限制，一樣要給使用者核准。
+        if target_year is None or target_month is None:
+            continue
+        seen_days = {key[0] for key in seen_dates}
+        for m in re.finditer(r'還班未還[:：]\s*補(\d{1,2})/(\d{1,2})', nurse.remarks or ''):
+            source_month, source_day = int(m.group(1)), int(m.group(2))
+            source_year = target_year if source_month < target_month else target_year - 1
+            try:
+                d = datetime(source_year, source_month, source_day)
+            except ValueError:
+                continue
+            if d.date() in seen_days:
+                continue
+            seen_days.add(d.date())
+            candidates.append(ReturnCredit(
+                credit_id=make_return_credit_id(sheet_name, nurse.name, d, '備註欠還班'),
+                sheet_name=sheet_name,
+                nurse_name=nurse.name,
+                source_date=d,
+                source_type='備註欠還班',
+                source='carry_over_detected',
+                approved=False,
+            ))
+            print(f"[備註欠還班候選] sheet={sheet_name} nurse={nurse.name} source_date={d.date()}")
     return candidates
 
 

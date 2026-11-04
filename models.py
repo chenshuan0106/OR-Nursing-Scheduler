@@ -67,6 +67,10 @@ class NurseInfo:
     # 上月的跨月補班記錄
     previous_month_cross_month_makeup_holidays: List[Dict] = field(default_factory=list)
 
+    # 還班結果（假日排班後填入，輸出時寫入備註）
+    unreturned_return_credits: List[Dict] = field(default_factory=list)  # 本月沒用掉的還班 [{'source_date': dt, 'reason': '1月換心'}]
+    returned_credit_dates: List[datetime] = field(default_factory=list)  # 本月已用掉的還班來源日期
+
     def __post_init__(self):
         # 1. 優化：確保預設為 dict/list 的欄位如果是 None，會被安全地初始化
         # (雖然 default_factory 通常不會給 None，但若從外部直接傳入 None 還是會出錯，加強防呆)
