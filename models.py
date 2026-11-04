@@ -1,8 +1,8 @@
 """
 護理人員資料模型
 """
-from typing import List, Dict
-from datetime import datetime
+from typing import List, Dict, Optional
+from datetime import datetime, date
 from dataclasses import dataclass, field
 
 # 全域設定：完全免排班的關鍵字清單
@@ -85,3 +85,49 @@ class NurseInfo:
                 self.is_exempt = True
                 self.exempt_reason = keyword
                 break
+
+
+def make_return_credit_id(sheet_name: str, nurse_name: str, source_date: datetime, source_type: str) -> str:
+    """建立還班 credit 的唯一識別碼（同一人可有多筆不同來源日期/來源類型的 credit）"""
+    source_day = source_date.date() if hasattr(source_date, 'date') else source_date
+    return f"{sheet_name}|{nurse_name}|{source_day.isoformat()}|{source_type}"
+
+
+@dataclass
+class ReturnCredit:
+    """
+    還班資格（return credit）：代表某位護理人員有一筆可以抵掉「一次」未來假日
+    正常輪值的資格。
+
+    還班 ≠ 補班：
+    - 補班（makeup_queue）：之前有一班因衝突沒排到，之後要另外找一班補回來（多上一班）。
+    - 還班（ReturnCredit）：有一筆資格，可以抵掉一次之後的正常假日輪值（少上一次班）。
+
+    `source` 有三種，approved 的預設值與 eligibility 判斷都不一樣：
+
+    - 'current_month_auto'：本月大夜/小夜排班「這次真的排到」平日國定假日，動態產生。
+      建立時就是 approved=True，不需要 UI 核准；但因為來源國假必須「已經發生」，
+      eligibility 要求 slot 日期晚於 source_date（不能提前使用還沒到的國假）。
+    - 'carry_over_detected'：從上月 Excel 解析出來的舊還班/補償資格，只是候選，
+      approved 預設 False，一定要經過 Streamlit UI 核准才能用；核准後跟 manual
+      走一樣的 use_after_date 邏輯。
+    - 'manual'：使用者在 Streamlit 手動指定，建立時就是 approved=True，屬於人工
+      override，不受「來源國假必須已發生」限制，只受自己設定的 use_after_date 限制。
+
+    detection（偵測到候選）、approval（使用者核准或自動核准）、consumption（排班
+    核心真正使用）三層要分開；一旦 approved=True，三種來源在排班核心的「消耗」
+    邏輯完全相同（只有 eligibility 的日期判斷式不同），沒有任何 bypass path。
+    """
+    credit_id: str
+    sheet_name: str
+    nurse_name: str
+    source_date: datetime          # 這筆資格的來源日期（例如本月/上月排到的國定假日）
+    source_type: str                # 來源班別說明，例如 '大夜'、'小夜'、'手動'
+    source: str                     # 'current_month_auto' / 'carry_over_detected' / 'manual'
+    approved: bool = False
+    consumed: bool = False
+    use_after_date: Optional[date] = None  # None = 下一個符合條件的正常班就使用；
+                                            # 有值 = 只有 slot 日期「晚於」此日期才能使用
+                                            # （'current_month_auto' 不使用這個欄位，
+                                            # 它的日期條件固定是「晚於 source_date」）
+    note: str = ''

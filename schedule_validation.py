@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 
 from date_utils import (
     get_night_shift_groups_for_month,
+    get_night_week_rest_days,
     get_p_shift_dates_for_month,
     is_holiday,
 )
@@ -160,8 +161,11 @@ def validate_schedule_results(all_results: Dict, year: int, month: int) -> List[
 
         # 工作日包含排班結果與 P1/P2/換心固定班，並保留跨月日期。
         work_days = defaultdict(set)
+        night_week_days = defaultdict(set)  # 大夜週的大夜日期（不含假日班的大夜）
         for day, _shift, nurse_name, _source in assignments:
             work_days[nurse_name].add(day)
+            if _shift == '大夜' and _source != '假日班':
+                night_week_days[nurse_name].add(day)
         for nurse in sheet.get('nurses', []):
             # 讀入的上月與跨月班也要納入，才能檢出月初/月底連續 7 天。
             for day in (
@@ -171,6 +175,11 @@ def validate_schedule_results(all_results: Dict, year: int, month: int) -> List[
                 + list(getattr(nurse, 'last_month_cross_month_small_night_dates', []))
             ):
                 work_days[nurse.name].add(day.date())
+            night_week_days[nurse.name].update(
+                d.date()
+                for d in list(getattr(nurse, 'night_shift_dates', []))
+                + list(getattr(nurse, 'last_month_cross_month_night_dates', []))
+            )
             relevant_year_months = {(day.year, day.month) for day in work_days[nurse.name]}
             if not relevant_year_months:
                 relevant_year_months = {(year, month)}
@@ -219,10 +228,16 @@ def validate_schedule_results(all_results: Dict, year: int, month: int) -> List[
                 d.date()
                 for d in list(nurse.leave_dates) + list(nurse.wedding_leave_dates)
             }
+            night_rest_days = get_night_week_rest_days(night_week_days[nurse.name])
             current = scan_first
             while current <= scan_last:
                 current_dt = datetime(current.year, current.month, current.day)
-                if current.weekday() < 5 and current not in leave_days and not is_holiday(current_dt):
+                if (
+                    current.weekday() < 5
+                    and current not in leave_days
+                    and current not in night_rest_days
+                    and not is_holiday(current_dt)
+                ):
                     work_days[nurse.name].add(current)
                 current += timedelta(days=1)
 

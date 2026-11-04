@@ -383,15 +383,10 @@ def create_schedule_excel_multi_sheet(
     all_results: Dict[str, Dict],
     year: int,
     month: int,
-) -> List[Dict[str, Any]]:
+):
     """
     建立多頁籤的排班結果 Excel
-
-    Returns:
-        holiday_overflow: 所有頁籤中，因為超過假日欄位版型上限（4欄）而未寫入
-        Excel 的紀錄清單，每筆為 {'sheet_name', 'nurse_name', 'column_needed', 'display_text'}。
-        呼叫端應該把這個清單清楚顯示給使用者，不能悄悄忽略。
-
+    
     all_results 格式:
     {
         '頁籤名': {
@@ -418,13 +413,12 @@ def create_schedule_excel_multi_sheet(
     }
 
     first_sheet = True
-    all_holiday_overflow: List[Dict[str, Any]] = []
 
     if pre_schedule_checks:
         default_sheet.title = '排班前核對'
         _write_pre_schedule_check_sheet(default_sheet, title, pre_schedule_checks, year, month)
         first_sheet = False
-
+    
     for sheet_name, results in all_results.items():
         output_sheet_name = _format_output_sheet_name(sheet_name, year, month)
         if first_sheet:
@@ -433,15 +427,12 @@ def create_schedule_excel_multi_sheet(
             first_sheet = False
         else:
             ws = wb.create_sheet(title=output_sheet_name)
-
-        sheet_overflow = _write_schedule_sheet(
+        
+        _write_schedule_sheet(
             ws, title, results, year, month, sheet_name
         )
-        if sheet_overflow:
-            all_holiday_overflow.extend(sheet_overflow)
-
+    
     wb.save(output_path)
-    return all_holiday_overflow
 
 
 def _format_output_sheet_name(sheet_name: str, year: int, month: int) -> str:
@@ -915,14 +906,9 @@ def _write_schedule_sheet(
     year: int,
     month: int,
     sheet_name: str,
-) -> List[Dict[str, Any]]:
+):
     """
     寫入單一頁籤的排班結果
-
-    Returns:
-        holiday_overflow: 因為超過假日欄位版型上限（4欄）而沒有寫入 Excel 的紀錄，
-        每筆為 {'sheet_name', 'nurse_name', 'column_needed', 'display_text'}。
-        排班核心結果本身不受影響，只是這裡沒有實體欄位可以顯示。
     """
     nurses = results.get('nurses', [])
     night_results = results.get('night_results', [])
@@ -1022,36 +1008,29 @@ def _write_schedule_sheet(
         nurse_extra_makeup_results[name].append(result)
 
     holiday_assignments = {}
-    holiday_overflow: List[Dict[str, Any]] = []
+
+    def _is_comp_like(r) -> bool:
+        # 國假補償（舊機制）跟還班都是「這格不是實際上班」的紀錄，
+        # 合併判斷邏輯要一致，才能跟正常班擠在同一格顯示。
+        return getattr(r, 'is_holiday_compensation', False) or getattr(r, 'is_return_credit', False)
 
     if holiday_results and nurses:
         for result in holiday_results:
             name = result.nurse.name
-            new_is_comp = getattr(result, 'is_holiday_compensation', False)
+            new_is_comp = _is_comp_like(result)
             col_num = getattr(result, 'column_index', 1)
             if col_num < 1:
                 col_num = 1
             if col_num > 4:
-                # 目前版型只有 4 個假日欄。不要壓回 col4（會撞掉別筆紀錄、
-                # 靜默遺失資料）——這筆記錄核心結果仍然完整保留在 holiday_results，
-                # 只是這次沒有實體欄位可以寫進 Excel，明確記下來回報給使用者。
-                from holiday_shift import format_holiday_shift_result
-                holiday_overflow.append({
-                    'sheet_name': sheet_name,
-                    'nurse_name': name,
-                    'column_needed': col_num,
-                    'display_text': format_holiday_shift_result(result, month).replace('\n', ' '),
-                })
-                print(f"  警告: {sheet_name} / {name} 需要第{col_num}個假日欄位，目前版型僅支援4欄，未寫入 Excel")
-                continue
+                col_num = 4
             key = (name, col_num)
             existing = holiday_assignments.get(key)
             if not existing:
                 holiday_assignments[key] = [result]
             else:
-                existing_is_comp = any(getattr(r, 'is_holiday_compensation', False) for r in existing)
-                existing_has_normal = any(not getattr(r, 'is_holiday_compensation', False) for r in existing)
-                # 同一格允許補休+正常班（擠在一起），避免重複塞相同類型
+                existing_is_comp = any(_is_comp_like(r) for r in existing)
+                existing_has_normal = any(not _is_comp_like(r) for r in existing)
+                # 同一格允許補休/還班+正常班（擠在一起），避免重複塞相同類型
                 if new_is_comp and existing_is_comp:
                     continue
                 if (not new_is_comp) and existing_has_normal:
@@ -1341,11 +1320,11 @@ def _write_schedule_sheet(
             holiday_cell = ws.cell(row=row_idx, column=col_idx)
             result_list = holiday_assignments.get((nurse.name, col_num))
             
-            # 檢查是否有國定假日補償（優先顯示補休假資訊）
+            # 檢查是否有國定假日補償或還班（優先顯示補休假資訊）
             has_holiday_compensation = False
             if result_list:
                 for result in result_list:
-                    if result.is_holiday_compensation:
+                    if result.is_holiday_compensation or getattr(result, 'is_return_credit', False):
                         has_holiday_compensation = True
                         break
             
@@ -1448,92 +1427,6 @@ def _write_schedule_sheet(
     for row in range(header_row, max_row + 1):
         ws.row_dimensions[row].height = two_line_height
 
-    return holiday_overflow
-
-
-def find_already_consumed_compensation_dates_from_excel(
-    filepath: str,
-    sheet_name: str,
-    target_year: int,
-) -> Dict[str, List[datetime]]:
-    """
-    從 Excel 假日班欄位掃描「補X/X」「捕X/X」（補償已使用）記錄，
-    找出每個人「已經用掉」的國定假日補償日期，避免同一筆補償被結轉到本月重複使用。
-
-    例如上個月的假日欄若寫「捕10/9(原10/17白班)」，代表 10/9 的補償
-    已經在上個月用掉了，10/9 不應該再被當成本月可用的補償結轉。
-
-    Returns:
-        {nurse_name: [已使用的補償日期, ...]}
-    """
-    wb = load_workbook(filepath, data_only=True)
-    ws = wb[sheet_name]
-
-    header_row = None
-    name_col = None
-    small_night_col = None
-    holiday_cols = []
-
-    def header_text(value):
-        return re.sub(r'\s+', '', str(value or ''))
-
-    for row_idx in range(1, 10):
-        row_values = [cell.value for cell in ws[row_idx]]
-        normalized_row_values = [header_text(value) for value in row_values]
-        if '主值' in normalized_row_values or '副值' in normalized_row_values:
-            header_row = row_idx
-            for col_idx, value in enumerate(row_values, 1):
-                normalized_value = header_text(value)
-                if normalized_value == '主值' or normalized_value == '副值':
-                    name_col = col_idx
-                elif normalized_value == '小夜週':
-                    small_night_col = col_idx
-                elif '假日' in normalized_value:
-                    holiday_cols.append(col_idx)
-            break
-
-    if header_row and not holiday_cols and small_night_col:
-        holiday_cols = list(range(small_night_col + 1, ws.max_column + 1))
-
-    if not header_row or not name_col or not holiday_cols:
-        wb.close()
-        return {}
-
-    consumed: Dict[str, List[datetime]] = {}
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        name_cell = ws.cell(row=row_idx, column=name_col).value
-        if not name_cell:
-            continue
-        name = str(name_cell).lstrip('*').strip()
-        if not name:
-            continue
-
-        for col_idx in holiday_cols:
-            cell_value = ws.cell(row=row_idx, column=col_idx).value
-            if not cell_value:
-                continue
-            text = str(cell_value).strip()
-            match = re.match(r'^[補捕]\s*(\d{1,2})/(\d{1,2})', text)
-            if not match:
-                continue
-            # 「補X/X(N月補跳值班)」是「預告下個月要用這筆補償跳過一次」，
-            # 這筆補償當下還沒真正用掉；只有「(原X/X班)」這種格式才代表
-            # 補償已經在本欄位對應的月份實際用掉、抵掉了某個原本排定的班。
-            # 不能把「預告」誤判成「已消耗」，否則會把還沒用的補償提前清除。
-            if re.search(r'\d+月補跳值班', text) or (re.search(r'\d+月補', text) and '原' not in text):
-                continue
-            month_num, day_num = int(match.group(1)), int(match.group(2))
-            try:
-                date = datetime(target_year, month_num, day_num)
-            except ValueError:
-                continue
-            consumed.setdefault(name, []).append(date)
-            print(f"  {name} 已在上月用掉補償 {month_num}/{day_num}（{text.splitlines()[0]}）")
-
-    wb.close()
-    return consumed
-
-
 def read_cross_month_makeup_holidays_from_excel(
     filepath: str,
     sheet_name: str,
@@ -1624,19 +1517,19 @@ def read_cross_month_makeup_holidays_from_excel(
         return None
 
     def _cross_month_skip_column(col_pos: int) -> int:
-        # 上月最後一個假日欄承接本月第一個假日區塊，輸出時落在本月假日第 1 欄。
+        # 本月假日第 1 欄保留給「還班」之類上月結轉的顯示位，不是本月自己的輪序，
+        # 所以上月最後一個假日欄承接的身分別（P1/P2/換心/待命）跳過記錄，
+        # 要落在本月假日第 2 欄，而不是第 1 欄。
         if col_pos == len(holiday_cols):
-            return 1
+            return 2
         return col_pos
 
     def _pending_makeup_column(col_pos: int) -> int:
-        # 「待補班」「X月補」是未指定日期的額外補班債務，上個月的文字
-        # 剛好寫在哪一欄純屬巧合、不代表任何欄位延續性（不像「-」或
-        # P1/P2 那種真正需要延續同一欄的紀錄）。額外補班本身有最高
-        # 優先權，永遠從第 1 欄開始搶；避免和正常輪值撞欄的責任交給
-        # holiday_shift.py 的 global_column_baseline（一旦本月有人需要
-        # 額外補班，所有「非額外補班」的結果都會自動從第 2 欄起算）。
-        return 1
+        # 「X月補」不是原欄位保留，而是上月待補班在本月找位置補。
+        # 若它寫在上月最後一個假日欄，本月輸出從第 2 欄承接，避免壓到第一個假日欄。
+        if col_pos == len(holiday_cols):
+            return 2 if len(holiday_cols) >= 4 else 1
+        return _cross_month_skip_column(col_pos)
 
     nurse_makeups = {}
     prev_month = target_month - 1 if target_month > 1 else 12

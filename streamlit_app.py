@@ -2,13 +2,14 @@
 護理排班系統 - Streamlit 網頁介面
 """
 import streamlit as st
+import pandas
 import tempfile
 import os
 import io
 import json
 import calendar
 import hashlib
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from contextlib import redirect_stdout
 
 # 設定頁面
@@ -121,7 +122,13 @@ try:
     from config import HOLIDAYS_2026
     from date_utils import roc_to_western_year
     from excel_handler import get_sheet_names, create_schedule_excel_multi_sheet
-    from main import parse_title_year_month, process_sheet, build_pre_schedule_check
+    from main import (
+        parse_title_year_month,
+        process_sheet,
+        build_pre_schedule_check,
+        get_return_credit_candidates_from_nurses,
+    )
+    from models import ReturnCredit, make_return_credit_id
     from night_shift import format_night_shift_result
     from small_night_shift import format_small_night_shift_result
     from holiday_shift import format_holiday_shift_result
@@ -130,42 +137,6 @@ except ImportError as e:
     modules_loaded = False
     st.error(f"❌ 無法載入排班模組: {e}")
     st.info("請確認所有相關檔案都在同一目錄下")
-
-
-@st.cache_data(show_spinner=False)
-def _cached_save_upload_to_temp(file_bytes: bytes) -> str:
-    """把上傳檔案內容寫入暫存檔，用內容當快取鍵——同一份檔案不會每次互動都重寫一次。"""
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
-        tmp_file.write(file_bytes)
-        return tmp_file.name
-
-
-@st.cache_data(show_spinner=False)
-def _cached_parse_title_year_month(file_bytes: bytes):
-    tmp_path = _cached_save_upload_to_temp(file_bytes)
-    return parse_title_year_month(tmp_path)
-
-
-@st.cache_data(show_spinner=False)
-def _cached_get_sheet_names(file_bytes: bytes):
-    tmp_path = _cached_save_upload_to_temp(file_bytes)
-    return get_sheet_names(tmp_path)
-
-
-@st.cache_data(show_spinner="正在建立排班前檢查...")
-def _cached_build_pre_schedule_checks(file_bytes: bytes, sheet_names: tuple, year: int, month: int):
-    """排班前檢查只跟檔案內容/年月有關，跟其他小地方的互動（如調整補班清單）無關，
-    快取起來避免每次網頁互動都重新解析整份 Excel，造成畫面很久才有反應。"""
-    tmp_path = _cached_save_upload_to_temp(file_bytes)
-    checks = {}
-    errors = {}
-    for sheet_name in sheet_names:
-        try:
-            checks[sheet_name] = build_pre_schedule_check(tmp_path, sheet_name, year, month)
-        except Exception as e:
-            errors[sheet_name] = str(e)
-    return checks, errors
-
 
 if modules_loaded:
     # 初始化 session state
@@ -180,6 +151,16 @@ if modules_loaded:
 
     if 'selected_year' not in st.session_state:
         st.session_state.selected_year = '2026'
+
+    # 還班（return credit）狀態：
+    # - approved_return_credits：這次排班已核准可用的 credit，key 是 credit_id，
+    #   不管是系統偵測後核准、還是使用者手動新增，一律存在這裡，排班核心只認這份清單。
+    # - detected_return_credit_candidates：每個頁籤系統偵測到、但「尚未核准」的候選，
+    #   只用來畫勾選 UI，跟 approved_return_credits 分開，避免 Excel 有資料就等於自動核准。
+    if 'approved_return_credits' not in st.session_state:
+        st.session_state.approved_return_credits = {}
+    if 'detected_return_credit_candidates' not in st.session_state:
+        st.session_state.detected_return_credit_candidates = {}
 
     def _nurse_name(nurse):
         return getattr(nurse, 'name', '')
@@ -218,10 +199,6 @@ if modules_loaded:
 
     def _removed_priority_makeup_key(sheet_name, shift_type):
         return f"removed_priority_makeup_entries_{shift_type}_{sheet_name}"
-
-    def _return_credit_key(sheet_name):
-        # 還班（本月確認名單）跟待補班用完全獨立的 session state，不共用、不互相影響。
-        return f"holiday_return_credit_entries_{sheet_name}"
 
     def _extra_makeup_key(sheet_name, shift_type):
         return f"extra_makeup_entries_{shift_type}_{sheet_name}"
@@ -568,127 +545,6 @@ if modules_loaded:
                 st.session_state[priority_key].append(item)
         st.session_state[signature_key] = signature
 
-    def _detected_return_credit_entries(nurses, year, month):
-        """偵測候選（suggestion only）：上個月未使用、延續到本月的國假補償。
-        只是顯示建議，不會自動生效——要生效必須被人工加進「本月還班人員」清單。"""
-        prev_month = 12 if month == 1 else month - 1
-        prev_year = year - 1 if month == 1 else year
-        entries = []
-        for nurse in nurses:
-            comp_dates = getattr(nurse, 'holiday_compensations_used', []) or []
-            count = sum(
-                1 for d in comp_dates
-                if (d.year, d.month) == (prev_year, prev_month)
-            )
-            if count > 0:
-                entries.append({
-                    'nurse_name': nurse.name,
-                    'source': f'上月（{prev_year}/{prev_month}）未使用國假補償',
-                    'credit_count': count,
-                })
-        return entries
-
-    def render_return_credit_section(sheet_name, nurses, nurse_names, year, month):
-        detected_entries = _detected_return_credit_entries(nurses, year, month)
-
-        return_key = _return_credit_key(sheet_name)
-        if return_key not in st.session_state:
-            st.session_state[return_key] = []
-        confirmed = st.session_state[return_key]
-        confirmed_names = {item.get('nurse_name') for item in confirmed}
-
-        st.markdown("**還班人員**")
-        st.caption(
-            "還班＝上個月未使用完的國假補償，延續到本月使用；跟「待補班」方向相反（還班是少上一班，不是多補一班）。"
-            "下面的候選名單只是系統依 Excel 資料算出來的建議，不會自動生效——"
-            "只有被加進「本月還班人員」清單的人，這個月才會真的觸發還班。"
-        )
-
-        if detected_entries:
-            with st.expander("已偵測到的還班候選（僅供參考，不會自動套用）", expanded=True):
-                for item in detected_entries:
-                    row1, row2, row3, row4 = st.columns([2, 3, 1, 2])
-                    with row1:
-                        st.write(item['nurse_name'])
-                    with row2:
-                        st.write(f"{item['source']}（可用 {item['credit_count']} 次）")
-                    already_added = item['nurse_name'] in confirmed_names
-                    with row3:
-                        st.write("✅ 已加入" if already_added else "")
-                    with row4:
-                        if not already_added:
-                            if st.button(
-                                "加入本月還班",
-                                key=f"add_return_credit_{sheet_name}_{item['nurse_name']}",
-                                use_container_width=True,
-                            ):
-                                confirmed.append({
-                                    'nurse_name': item['nurse_name'],
-                                    'credit_count': item['credit_count'],
-                                    'source': item['source'],
-                                })
-                                st.rerun()
-        else:
-            st.info("目前沒有從 Excel 偵測到上月未使用的國假補償。")
-
-        with st.expander("手動新增還班人員", expanded=False):
-            add_col1, add_col2, add_col3 = st.columns([2, 1, 1])
-            with add_col1:
-                selected_return_nurse = st.selectbox(
-                    "選擇人員",
-                    options=["請選擇"] + nurse_names,
-                    key=f"return_credit_nurse_{sheet_name}",
-                )
-            with add_col2:
-                manual_credit_count = st.number_input(
-                    "可用次數",
-                    min_value=1,
-                    value=1,
-                    step=1,
-                    key=f"return_credit_manual_count_{sheet_name}",
-                )
-            with add_col3:
-                st.write("")
-                if st.button("加入", key=f"add_manual_return_credit_{sheet_name}", use_container_width=True):
-                    if selected_return_nurse == "請選擇":
-                        st.warning("請先選擇人員。")
-                    elif selected_return_nurse in confirmed_names:
-                        st.warning(f"{selected_return_nurse} 已經在本月還班人員清單中。")
-                    else:
-                        confirmed.append({
-                            'nurse_name': selected_return_nurse,
-                            'credit_count': int(manual_credit_count),
-                            'source': '手動新增',
-                        })
-                        st.success(f"已加入：{selected_return_nurse}（{manual_credit_count} 次）")
-                        st.rerun()
-
-        st.markdown("**本月還班人員**（實際會傳進排班核心的名單）")
-        if not confirmed:
-            st.info("目前沒有人被核准還班——沒有人會觸發還班。")
-        else:
-            for idx, item in enumerate(list(confirmed)):
-                row1, row2, row3 = st.columns([3, 2, 1])
-                with row1:
-                    st.write(f"{item.get('nurse_name')}（{item.get('source', '')}）")
-                with row2:
-                    new_count = st.number_input(
-                        "可用次數",
-                        min_value=1,
-                        value=int(item.get('credit_count', 1)),
-                        step=1,
-                        key=f"return_credit_count_{sheet_name}_{idx}",
-                        label_visibility="collapsed",
-                    )
-                    confirmed[idx]['credit_count'] = int(new_count)
-                with row3:
-                    if st.button("刪除", key=f"delete_return_credit_{sheet_name}_{idx}", use_container_width=True):
-                        confirmed.pop(idx)
-                        st.rerun()
-
-    def get_return_credit_entries(sheet_name):
-        return list(st.session_state.get(_return_credit_key(sheet_name), []))
-
     def render_priority_makeup_section(sheet_name, nurses, nurse_names, shift_type, carryover_records_by_nurse=None):
         detected_entries = _detected_priority_makeup_entries(nurses, shift_type, carryover_records_by_nurse)
         _sync_detected_priority_makeup(sheet_name, shift_type, detected_entries)
@@ -876,6 +732,257 @@ if modules_loaded:
                 st.session_state[extra_key] = []
                 st.rerun()
 
+    # ------------------------------------------------------------------
+    # 還班（return credit）UI
+    #
+    # 三層分開：
+    #   detected_return_credit_candidates[sheet_name] -> 系統偵測到但「尚未核准」的候選
+    #   approved_return_credits[credit_id]             -> 已核准可用（系統偵測核准 + 手動指定）
+    # 排班核心只讀 approved_return_credits，偵測到的候選一定要使用者勾選才會進去。
+    # ------------------------------------------------------------------
+
+    _RETURN_CREDIT_SOURCE_LABEL = {
+        'carry_over_detected': '上月結轉',
+        'manual': '手動指定',
+        'current_month_auto': '本月自動',
+    }
+    _RETURN_CREDIT_EFFECTIVE_OPTIONS = ["接下來第一班", "指定日期後"]
+
+    def render_return_credit_section(sheet_names, pre_schedule_checks):
+        st.header("📋 還班設定")
+        st.info(
+            "還班＝抵掉一次之後的正常假日輪值（不是補班，不會多上一班）。"
+            "本月排班中新產生的國假補償會自動套用，不需要在這裡核准；"
+            "這裡只處理「核准上月結轉的舊資格」或「手動新增」。",
+            icon="ℹ️",
+        )
+
+        approved = st.session_state.approved_return_credits  # Dict[str, ReturnCredit]
+
+        # 收集各頁籤的上月結轉候選（只解析一次、存進 session_state，之後重跑直接沿用）。
+        all_candidates = []
+        for sheet_name in sheet_names:
+            check = pre_schedule_checks.get(sheet_name)
+            if not check:
+                continue
+            if sheet_name not in st.session_state.detected_return_credit_candidates:
+                st.session_state.detected_return_credit_candidates[sheet_name] = (
+                    get_return_credit_candidates_from_nurses(
+                        sheet_name,
+                        check.get('nurses') or [],
+                        check.get('year'),
+                        check.get('month'),
+                    )
+                )
+            all_candidates.extend(st.session_state.detected_return_credit_candidates[sheet_name])
+
+        # ---------------- 上月結轉候選：一張表 + 一個送出按鈕 ----------------
+        # 全部包在 st.form 裡：改欄位（核准/生效方式/生效日期）不會整頁重跑，
+        # 只有按「套用核准設定」才會處理一次，這是「改一個設定就要等很久」的主要解法。
+        with st.container(border=True):
+            st.subheader("① 上月結轉候選")
+            if not all_candidates:
+                st.caption("目前沒有從 Excel 偵測到上月結轉的還班候選。")
+            else:
+                candidate_by_id = {c.credit_id: c for c in all_candidates}
+                rows = []
+                for c in all_candidates:
+                    existing = approved.get(c.credit_id)
+                    rows.append({
+                        "credit_id": c.credit_id,
+                        "核准": existing is not None,
+                        "頁籤": c.sheet_name,
+                        "姓名": c.nurse_name,
+                        "來源日期": f"{c.source_date.month}/{c.source_date.day}",
+                        "來源類型": c.source_type,
+                        "生效方式": (
+                            "指定日期後" if (existing and existing.use_after_date) else "接下來第一班"
+                        ),
+                        "生效日期": (existing.use_after_date if existing else None) or c.source_date.date(),
+                    })
+                candidates_df = pandas.DataFrame(rows).set_index('credit_id')
+                with st.form("carry_over_return_credit_form"):
+                    edited_df = st.data_editor(
+                        candidates_df,
+                        hide_index=True,
+                        width="stretch",
+                        key="carry_over_return_credit_editor",
+                        column_config={
+                            "核准": st.column_config.CheckboxColumn("核准", width="small"),
+                            "頁籤": st.column_config.TextColumn("頁籤", disabled=True),
+                            "姓名": st.column_config.TextColumn("姓名", disabled=True),
+                            "來源日期": st.column_config.TextColumn("來源日期", disabled=True),
+                            "來源類型": st.column_config.TextColumn("來源類型", disabled=True),
+                            "生效方式": st.column_config.SelectboxColumn(
+                                "生效方式", options=_RETURN_CREDIT_EFFECTIVE_OPTIONS, required=True
+                            ),
+                            "生效日期": st.column_config.DateColumn(
+                                "生效日期（生效方式選「指定日期後」才會用到）"
+                            ),
+                        },
+                    )
+                    submitted = st.form_submit_button("套用核准設定", type="primary", width="stretch")
+                if submitted:
+                    changed = 0
+                    for credit_id, row in edited_df.iterrows():
+                        candidate = candidate_by_id.get(credit_id)
+                        if candidate is None:
+                            continue
+                        if row['核准']:
+                            use_after = row['生效日期'] if row['生效方式'] == '指定日期後' else None
+                            approved[credit_id] = ReturnCredit(
+                                credit_id=credit_id,
+                                sheet_name=candidate.sheet_name,
+                                nurse_name=candidate.nurse_name,
+                                source_date=candidate.source_date,
+                                source_type=candidate.source_type,
+                                source='carry_over_detected',
+                                approved=True,
+                                use_after_date=use_after,
+                            )
+                            print(
+                                f"[上月還班核准] nurse={candidate.nurse_name} credit={candidate.source_date.date()} "
+                                f"use_after_date={use_after} approved=True source=carry_over_detected"
+                            )
+                            changed += 1
+                        elif credit_id in approved:
+                            del approved[credit_id]
+                    st.success(f"已套用核准設定（{changed} 筆核准中）。")
+
+        # ---------------- 手動指定還班 ----------------
+        # 頁籤放表單外面，選了立刻換人員清單；其餘欄位放表單裡一起送出，
+        # 避免調日期/切換選項時每次都整頁重跑。
+        with st.container(border=True):
+            st.subheader("② 手動指定還班")
+            manual_sheet = st.selectbox("頁籤", options=sheet_names, key="manual_return_credit_sheet")
+            manual_nurse_names = [n.name for n in (pre_schedule_checks.get(manual_sheet, {}).get('nurses') or [])]
+
+            check_for_default = pre_schedule_checks.get(manual_sheet, {})
+            default_year = check_for_default.get('year') or date.today().year
+            default_month = check_for_default.get('month') or date.today().month
+            prev_month = default_month - 1 if default_month > 1 else 12
+            prev_year = default_year if default_month > 1 else default_year - 1
+            default_source_date = date(prev_year, prev_month, 1)
+
+            with st.form("manual_return_credit_form", clear_on_submit=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    manual_nurse = st.selectbox(
+                        "人員", options=["請選擇"] + manual_nurse_names, key="manual_return_credit_nurse"
+                    )
+                    manual_source_date = st.date_input(
+                        "還班來源日期（預設上個月月初，請務必改成實際日期）",
+                        value=default_source_date,
+                        key="manual_return_credit_source_date",
+                    )
+                with col2:
+                    manual_mode = st.radio(
+                        "使用方式",
+                        _RETURN_CREDIT_EFFECTIVE_OPTIONS,
+                        index=0,
+                        key="manual_return_credit_mode",
+                        horizontal=True,
+                    )
+                    manual_use_after_date = st.date_input(
+                        "指定日期後才使用（不含當天；選「接下來第一班」時這欄不生效）",
+                        value=default_source_date,
+                        key="manual_return_credit_use_after_date",
+                    )
+                manual_note = st.text_input("說明", key="manual_return_credit_note")
+                submitted_manual = st.form_submit_button("＋ 加入還班", type="primary", width="stretch")
+
+            if submitted_manual:
+                if manual_nurse == "請選擇":
+                    st.warning("請先選擇人員。")
+                else:
+                    months_away = abs(
+                        (manual_source_date.year * 12 + manual_source_date.month)
+                        - (default_year * 12 + default_month)
+                    )
+                    if months_away > 2:
+                        st.warning(
+                            f"⚠️ 來源日期（{manual_source_date}）離本次排班月份（{default_year}/{default_month}）"
+                            f"有點遠，請確認不是忘記改掉預設值。這筆還是已加入，若不對請到下面移除。"
+                        )
+                    source_dt = datetime(manual_source_date.year, manual_source_date.month, manual_source_date.day)
+                    credit_id = make_return_credit_id(manual_sheet, manual_nurse, source_dt, '手動')
+                    duplicate = any(
+                        c.sheet_name == manual_sheet
+                        and c.nurse_name == manual_nurse
+                        and c.source_date.date() == source_dt.date()
+                        for c in approved.values()
+                    )
+                    if duplicate:
+                        st.warning("此還班資格已存在，不重複新增。")
+                    else:
+                        use_after = manual_use_after_date if manual_mode == "指定日期後" else None
+                        approved[credit_id] = ReturnCredit(
+                            credit_id=credit_id,
+                            sheet_name=manual_sheet,
+                            nurse_name=manual_nurse,
+                            source_date=source_dt,
+                            source_type='手動',
+                            source='manual',
+                            approved=True,
+                            use_after_date=use_after,
+                            note=manual_note,
+                        )
+                        print(
+                            f"[手動還班] nurse={manual_nurse} credit={source_dt.date()} "
+                            f"use_after_date={use_after} approved=True source=manual"
+                        )
+                        st.success(f"已加入：{manual_nurse}｜來源 {manual_source_date.month}/{manual_source_date.day}")
+
+        # ---------------- 本次已核准還班 ----------------
+        with st.container(border=True):
+            st.subheader(f"✅ 本次已核准還班（{len(approved)} 筆）")
+            if not approved:
+                st.caption("目前沒有已核准的還班資格。")
+            else:
+                approved_rows = []
+                for credit_id, credit in approved.items():
+                    effective_text = (
+                        "接下來第一班" if credit.use_after_date is None else f"{credit.use_after_date} 之後"
+                    )
+                    approved_rows.append({
+                        "credit_id": credit_id,
+                        "移除": False,
+                        "姓名": credit.nurse_name,
+                        "頁籤": credit.sheet_name,
+                        "來源日期": f"{credit.source_date.month}/{credit.source_date.day}（{credit.source_type}）",
+                        "生效": effective_text,
+                        "來源": _RETURN_CREDIT_SOURCE_LABEL.get(credit.source, credit.source),
+                        "說明": credit.note,
+                    })
+                approved_df = pandas.DataFrame(approved_rows).set_index('credit_id')
+                with st.form("approved_return_credit_remove_form"):
+                    edited_approved_df = st.data_editor(
+                        approved_df,
+                        hide_index=True,
+                        width="stretch",
+                        key="approved_return_credit_editor",
+                        column_config={
+                            "移除": st.column_config.CheckboxColumn("移除", width="small"),
+                            "姓名": st.column_config.TextColumn(disabled=True),
+                            "頁籤": st.column_config.TextColumn(disabled=True),
+                            "來源日期": st.column_config.TextColumn(disabled=True),
+                            "生效": st.column_config.TextColumn(disabled=True),
+                            "來源": st.column_config.TextColumn(disabled=True),
+                            "說明": st.column_config.TextColumn(disabled=True),
+                        },
+                    )
+                    submitted_remove = st.form_submit_button("套用移除", width="stretch")
+                if submitted_remove:
+                    removed = 0
+                    for credit_id, row in edited_approved_df.iterrows():
+                        if row['移除'] and credit_id in approved:
+                            del approved[credit_id]
+                            removed += 1
+                    if removed:
+                        st.success(f"已移除 {removed} 筆。")
+                    else:
+                        st.info("沒有勾選要移除的項目。")
+
     def render_pre_schedule_checks(pre_checks):
         st.header("🔎 排班前檢查")
         st.caption("先看總覽，有需要再進入自填班、補班或跨月資料調整。")
@@ -1015,14 +1122,6 @@ if modules_loaded:
                         nurse_names,
                         "假日班",
                         carryover_records_by_nurse,
-                    )
-                    st.markdown("---")
-                    render_return_credit_section(
-                        sheet_name,
-                        nurses,
-                        nurse_names,
-                        int(check.get('year')),
-                        int(check.get('month')),
                     )
                     st.markdown("---")
                     st.markdown("**假日額外補班**")
@@ -1185,20 +1284,6 @@ if modules_loaded:
 
         st.markdown("---")
         st.success("✅ 排班完成！")
-
-        holiday_overflow = run.get('holiday_overflow') or []
-        if holiday_overflow:
-            st.error(
-                f"⚠️ 本次排班有 {len(holiday_overflow)} 筆假日欄位超出 Excel 版型，"
-                "請先查看下方警告後再使用此班表。"
-            )
-            with st.expander(f"⚠️ 假日欄位超出版型明細（{len(holiday_overflow)} 筆，未寫入 Excel）", expanded=True):
-                st.caption("排班核心結果完整保留這些紀錄，只是目前假日欄位版型僅 4 欄，暫時無法顯示在 Excel 裡。")
-                for item in holiday_overflow:
-                    st.warning(
-                        f"{item['sheet_name']} / {item['nurse_name']}：需要第{item['column_needed']}個假日欄位，"
-                        f"目前版型僅支援4欄。未寫入：{item['display_text']}"
-                    )
 
         st.header("📥 下載結果")
         st.download_button(
@@ -1385,13 +1470,50 @@ if modules_loaded:
     )
 
     if uploaded_file is not None:
-        # 儲存上傳的檔案到臨時位置（用內容快取，避免同一份檔案每次互動都重寫/重解析）
-        file_bytes = uploaded_file.getvalue()
-        tmp_path = _cached_save_upload_to_temp(file_bytes)
+        # 檔案簽章：用來判斷是不是同一份上傳（Streamlit 每動一個元件都會整頁重跑，
+        # 若每次都重寫暫存檔、重新解析 Excel，會導致光是改一個設定就要跑很久）
+        file_signature = (uploaded_file.name, uploaded_file.size, getattr(uploaded_file, 'file_id', None))
+
+        if st.session_state.get('_uploaded_file_signature') != file_signature:
+            # 真的是新上傳的檔案，才需要重寫暫存檔並清掉舊的排班前檢查快取。
+            # 注意順序：先寫好新檔、更新 session_state，最後才刪舊檔——
+            # 因為 Streamlit 的重跑可能在中途被下一次互動打斷，若先刪舊檔
+            # 才更新 session_state，一旦跑到一半被打斷，session_state 就會
+            # 卡在指向一個已經被刪除的暫存檔，下次重跑就會 FileNotFoundError。
+            old_tmp_path = st.session_state.get('_uploaded_tmp_path')
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
+                tmp_file.write(uploaded_file.getvalue())
+                tmp_path = tmp_file.name
+
+            st.session_state['_uploaded_file_signature'] = file_signature
+            st.session_state['_uploaded_tmp_path'] = tmp_path
+            st.session_state['_pre_schedule_checks'] = None
+            st.session_state['_pre_schedule_checks_key'] = None
+            # 換了一份新檔案，上一份檔案核准的還班/候選狀態就不該沿用，全部清空重解析。
+            st.session_state.approved_return_credits = {}
+            st.session_state.detected_return_credit_candidates = {}
+
+            if old_tmp_path and old_tmp_path != tmp_path and os.path.exists(old_tmp_path):
+                try:
+                    os.remove(old_tmp_path)
+                except OSError:
+                    pass
+        else:
+            # 同一份檔案，重跑只是因為其他元件被點擊，直接沿用暫存檔，不重寫。
+            # 若暫存檔意外不見了（例如系統清過 Temp），自動重寫一份，不要整頁報錯。
+            tmp_path = st.session_state['_uploaded_tmp_path']
+            if not os.path.exists(tmp_path):
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    tmp_path = tmp_file.name
+                st.session_state['_uploaded_tmp_path'] = tmp_path
+                st.session_state['_pre_schedule_checks'] = None
+                st.session_state['_pre_schedule_checks_key'] = None
 
         try:
             # 解析年月
-            roc_year, input_month = _cached_parse_title_year_month(file_bytes)
+            roc_year, input_month = parse_title_year_month(tmp_path)
 
             if roc_year is None or input_month is None:
                 st.error("❌ 無法從 Excel 標題解析年份和月份")
@@ -1411,6 +1533,9 @@ if modules_loaded:
                 # 檢查對應年份的國定假日設定
                 year_str = str(year)
                 holidays_for_year = st.session_state.all_holidays.get(year_str)
+                # 排班前檢查（含大夜欄國假還班偵測）也要用目標年份的國定假日。
+                config.HOLIDAYS_2026 = holidays_for_year or {}
+                config.HOLIDAYS_BY_YEAR = st.session_state.all_holidays
                 month_holidays = {}
                 holiday_metric_text = '未設定'
                 if holidays_for_year is not None:
@@ -1438,7 +1563,7 @@ if modules_loaded:
                     st.metric("🎌 國定假日", holiday_metric_text)
 
                 # 取得頁籤
-                sheet_names = _cached_get_sheet_names(file_bytes)
+                sheet_names = get_sheet_names(tmp_path)
                 st.info(f"📑 找到 {len(sheet_names)} 個頁籤: {', '.join(sheet_names)}")
 
                 if holidays_for_year is None:
@@ -1446,16 +1571,44 @@ if modules_loaded:
 
                 st.markdown("---")
 
-                pre_schedule_checks, pre_schedule_errors = _cached_build_pre_schedule_checks(
-                    file_bytes, tuple(sheet_names), year, month
-                )
-                for sheet_name, err in pre_schedule_errors.items():
-                    st.error(f"建立 {sheet_name} 排班前檢查時發生錯誤: {err}")
+                # 排班前檢查很吃重（每個頁籤要重讀好幾次 Excel），
+                # 用 session_state 快取，同一份檔案只在第一次算，
+                # 之後只是切換其他設定造成整頁重跑時直接沿用結果。
+                pre_schedule_checks_key = (tmp_path, year, month, tuple(sheet_names))
+                if (
+                    st.session_state.get('_pre_schedule_checks') is not None
+                    and st.session_state.get('_pre_schedule_checks_key') == pre_schedule_checks_key
+                ):
+                    pre_schedule_checks = st.session_state['_pre_schedule_checks']
+                else:
+                    pre_schedule_checks = {}
+                    with st.spinner("正在建立排班前檢查..."):
+                        for sheet_name in sheet_names:
+                            try:
+                                pre_schedule_checks[sheet_name] = build_pre_schedule_check(
+                                    tmp_path,
+                                    sheet_name,
+                                    year,
+                                    month,
+                                )
+                            except Exception as e:
+                                st.error(f"建立 {sheet_name} 排班前檢查時發生錯誤: {e}")
+                    st.session_state['_pre_schedule_checks'] = pre_schedule_checks
+                    st.session_state['_pre_schedule_checks_key'] = pre_schedule_checks_key
 
                 if pre_schedule_checks:
                     render_pre_schedule_checks(pre_schedule_checks)
 
                 st.markdown("---")
+
+                if pre_schedule_checks:
+                    render_return_credit_section(sheet_names, pre_schedule_checks)
+
+                st.markdown("---")
+
+                include_pre_check_sheet = st.checkbox(
+                    "下載結果包含「排班前核對」頁籤", value=False, key="include_pre_check_sheet"
+                )
 
                 # 排班按鈕
                 if st.button("🚀 開始排班", type="primary", use_container_width=True):
@@ -1495,7 +1648,6 @@ if modules_loaded:
                             manual_past_makeup_entries = get_manual_past_makeup_entries(sheet_name)
                             manual_shift_entries = get_manual_shift_entries(sheet_name)
                             priority_makeup_entries = get_priority_makeup_entries(sheet_name)
-                            return_credit_entries = get_return_credit_entries(sheet_name)
                             extra_makeup_entries = (
                                 get_extra_makeup_entries(sheet_name)
                                 + manual_makeup_entries_to_extra(manual_past_makeup_entries)
@@ -1530,7 +1682,7 @@ if modules_loaded:
                                         priority_makeup_entries=priority_makeup_entries,
                                         extra_makeup_entries=extra_makeup_entries,
                                         manual_makeup_note=manual_makeup_note,
-                                        return_credit_entries=return_credit_entries,
+                                        approved_return_credits=list(st.session_state.approved_return_credits.values()),
                                     )
 
                                     all_results[sheet_name] = {
@@ -1544,7 +1696,7 @@ if modules_loaded:
                                         'holiday_last_normal': holiday_last_normal,
                                         'night_identity_skipped': night_identity_skipped,
                                         'small_night_identity_skipped': small_night_identity_skipped,
-                                        'pre_schedule_check': pre_schedule_check,
+                                        'pre_schedule_check': pre_schedule_check if include_pre_check_sheet else None,
                                         'manual_anchor_overrides': manual_anchor_overrides,
                                         'manual_shift_entries': manual_shift_entries,
                                         'priority_makeup_entries': priority_makeup_entries,
@@ -1580,10 +1732,10 @@ if modules_loaded:
                         output_path = output_tmp.name
 
                     title = f"臺北榮民總醫院護理部思源手術室{roc_year}年{month}月值班表"
-                    holiday_overflow = create_schedule_excel_multi_sheet(output_path, title, all_results, year, month)
+                    create_schedule_excel_multi_sheet(output_path, title, all_results, year, month)
 
                     progress_bar.progress(1.0)
-                    status_text.text("✅ 排班完成！")
+                    status_text.empty()
 
                     with open(output_path, 'rb') as f:
                         output_bytes = f.read()
@@ -1594,7 +1746,6 @@ if modules_loaded:
                         'output_filename': output_filename,
                         'log_text': log_output.getvalue(),
                         'month': month,
-                        'holiday_overflow': holiday_overflow or [],
                     }
 
                     # 清理臨時輸出檔案
@@ -1608,17 +1759,12 @@ if modules_loaded:
             import traceback
             st.code(traceback.format_exc())
 
-        # 注意：不在這裡刪除 tmp_path。上面的暫存檔路徑是用檔案內容快取的
-        # （_cached_save_upload_to_temp），同一份上傳檔案在後續互動中會重複用到
-        # 同一個路徑；每次互動都刪除會讓快取失效，導致每個小變動都要重新解析整份 Excel。
-        # 換上傳新檔案時清掉舊的暫存檔，避免暫存檔無限累積。
-        prev_tmp_path = st.session_state.get('_last_tmp_path')
-        if prev_tmp_path and prev_tmp_path != tmp_path:
+        finally:
+            # 清理臨時上傳檔案
             try:
-                os.unlink(prev_tmp_path)
-            except OSError:
+                os.unlink(tmp_path)
+            except:
                 pass
-        st.session_state['_last_tmp_path'] = tmp_path
 
         if st.session_state.get('last_run'):
             render_last_run()

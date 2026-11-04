@@ -257,10 +257,15 @@ def schedule_small_night_shifts(
 
     # 清掉本月預排的小夜週日期，避免重新排班時累積舊資料。
     # 已先排定的額外補班必須保留。
+    # 上月 Excel 已排、跨入本月的小夜週（例如 12/28-1/1）也要保留；
+    # 落在本月班組內的日期會在下方 scheduled_days 過濾掉。
     for nurse in nurses:
+        manual_days = {d.date() for d in getattr(nurse, 'manual_small_night_shift_dates', [])}
         nurse.small_night_shift_dates = [
             d for d in nurse.small_night_shift_dates
-            if d.date() in reserved_days or d.month != target_month or d.year != target_year
+            if d.date() in reserved_days
+            or d.date() in manual_days
+            or d.month != target_month or d.year != target_year
         ]
 
     # 取得本月小夜週班組。

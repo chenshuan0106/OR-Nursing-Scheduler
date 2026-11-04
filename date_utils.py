@@ -18,10 +18,17 @@ def western_to_roc_year(western_year: int) -> int:
     return western_year - 1911
 
 
-def parse_date_string(date_str: str, default_year: int = 2026) -> Optional[datetime]:
+def parse_date_string(
+    date_str: str,
+    default_year: int = 2026,
+    reference_month: Optional[int] = None,
+) -> Optional[datetime]:
     """
     解析日期字串，支援多種格式
     例如: '2/5', '2/05', '02/5'
+
+    有給 reference_month 時，年份取最接近 (default_year, reference_month) 的那一年，
+    例如排 1 月時讀到上月的 '12/24' 會解析成前一年 12/24。
     """
     if not date_str or not isinstance(date_str, str):
         return None
@@ -34,14 +41,24 @@ def parse_date_string(date_str: str, default_year: int = 2026) -> Optional[datet
         if len(parts) == 2:
             month = int(parts[0])
             day = int(parts[1])
-            return datetime(default_year, month, day)
+            year = default_year
+            if reference_month:
+                year = min(
+                    (default_year, default_year - 1, default_year + 1),
+                    key=lambda y: abs((y - default_year) * 12 + month - reference_month),
+                )
+            return datetime(year, month, day)
     except (ValueError, IndexError):
         pass
     
     return None
 
 
-def parse_date_range(range_str: str, default_year: int = 2026) -> List[datetime]:
+def parse_date_range(
+    range_str: str,
+    default_year: int = 2026,
+    reference_month: Optional[int] = None,
+) -> List[datetime]:
     """
     解析日期範圍字串
     例如: '2/2-2/8' -> [datetime(2026, 2, 2), ..., datetime(2026, 2, 8)]
@@ -55,8 +72,8 @@ def parse_date_range(range_str: str, default_year: int = 2026) -> List[datetime]
     if '-' in range_str:
         parts = range_str.split('-')
         if len(parts) == 2:
-            start_date = parse_date_string(parts[0], default_year)
-            end_date = parse_date_string(parts[1], default_year)
+            start_date = parse_date_string(parts[0], default_year, reference_month)
+            end_date = parse_date_string(parts[1], default_year, reference_month)
             
             if start_date and end_date:
                 # 處理跨年的情況
@@ -73,7 +90,11 @@ def parse_date_range(range_str: str, default_year: int = 2026) -> List[datetime]
     return []
 
 
-def parse_dot_separated_dates(date_str: str, default_year: int = 2026) -> List[datetime]:
+def parse_dot_separated_dates(
+    date_str: str,
+    default_year: int = 2026,
+    reference_month: Optional[int] = None,
+) -> List[datetime]:
     """
     解析用點分隔的日期
     例如: '2/5.2/6.2/7' -> [datetime(2026, 2, 5), datetime(2026, 2, 6), datetime(2026, 2, 7)]
@@ -85,8 +106,8 @@ def parse_dot_separated_dates(date_str: str, default_year: int = 2026) -> List[d
     # 支援日期區間: 2/23-2/27
     range_pattern = r'(\d{1,2}/\d{1,2})\s*-\s*(\d{1,2}/\d{1,2})'
     for start_str, end_str in re.findall(range_pattern, date_str):
-        start_date = parse_date_string(start_str, default_year)
-        end_date = parse_date_string(end_str, default_year)
+        start_date = parse_date_string(start_str, default_year, reference_month)
+        end_date = parse_date_string(end_str, default_year, reference_month)
         if start_date and end_date:
             if end_date < start_date:
                 end_date = end_date.replace(year=end_date.year + 1)
@@ -97,7 +118,7 @@ def parse_dot_separated_dates(date_str: str, default_year: int = 2026) -> List[d
 
     parts = date_str.split('.')
     for part in parts:
-        date = parse_date_string(part.strip(), default_year)
+        date = parse_date_string(part.strip(), default_year, reference_month)
         if date:
             dates.append(date)
 
@@ -132,6 +153,14 @@ def is_holiday(date: datetime) -> bool:
     """判斷是否為國定假日"""
     date_key = f"{date.month}/{date.day}"
     return date_key in config.HOLIDAYS_2026
+
+
+def is_holiday_in_own_year(date: datetime) -> bool:
+    """依日期本身的年份判斷國定假日；沒有該年設定時退回目標年份的清單。"""
+    holidays = config.HOLIDAYS_BY_YEAR.get(str(date.year))
+    if holidays is None:
+        return is_holiday(date)
+    return f"{date.month}/{date.day}" in holidays
 
 
 def get_holiday_name(date: datetime) -> Optional[str]:
@@ -236,6 +265,22 @@ def dates_overlap(dates1: List[datetime], dates2: List[datetime]) -> bool:
     set1 = set(d.date() for d in dates1)
     set2 = set(d.date() for d in dates2)
     return bool(set1 & set2)
+
+
+def get_night_week_rest_days(night_dates) -> set:
+    """
+    大夜那一週（週一～週五）除了大夜當天以外的平日都不用上白班，回傳這些休息日。
+    例如大夜 1/28-1/30（四～六）→ 1/25-1/27 休息；大夜週一～三 → 週四、週五休息。
+    """
+    night_days = {d.date() if hasattr(d, 'date') else d for d in night_dates}
+    rest_days = set()
+    for day in night_days:
+        monday = day - timedelta(days=day.weekday())
+        for offset in range(5):
+            weekday = monday + timedelta(days=offset)
+            if weekday not in night_days:
+                rest_days.add(weekday)
+    return rest_days
 
 
 def would_cause_consecutive_7_days(

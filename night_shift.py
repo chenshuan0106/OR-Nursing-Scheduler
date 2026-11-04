@@ -61,7 +61,8 @@ def should_skip_night_shift(
 
     # 4. 檢查是否超過連續工作天數限制。
     skip, reason = should_skip_for_consecutive_days(
-        nurse, target_dates, target_month, target_year, prev_month, next_month
+        nurse, target_dates, target_month, target_year, prev_month, next_month,
+        is_night_shift=True,
     )
     if skip:
         return True, reason
@@ -200,10 +201,15 @@ def schedule_night_shifts(
     # 清掉本月預排的大夜日期，避免重新排班時累積舊資料。
     # 已先排定的額外補班必須保留。
     # 跨月排班由後續 scheduled_days 再統一處理。
+    # 上月 Excel 已排、跨入本月的大夜（例如 12/31.1/1.1/2）也要保留；
+    # 若落在本月班組內，下方 scheduled_days 過濾後會由手動自填重新加回。
     for nurse in nurses:
+        manual_days = {d.date() for d in getattr(nurse, 'manual_night_shift_dates', [])}
         nurse.night_shift_dates = [
             d for d in nurse.night_shift_dates
-            if d.date() in reserved_days or d.month != target_month or d.year != target_year
+            if d.date() in reserved_days
+            or d.date() in manual_days
+            or d.month != target_month or d.year != target_year
         ]
 
     # 取得本月大夜班組別。

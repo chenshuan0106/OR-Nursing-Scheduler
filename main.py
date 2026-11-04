@@ -18,7 +18,7 @@ from date_utils import (
     roc_to_western_year,
     format_dates_to_dot_string,
 )
-from models import NurseInfo
+from models import NurseInfo, ReturnCredit, make_return_credit_id
 from shift_utils import parse_nurse_info_from_row
 from night_shift import schedule_night_shifts, should_skip_night_shift
 from small_night_shift import schedule_small_night_shifts, should_skip_small_night_shift, get_small_night_shift_groups_for_month
@@ -233,7 +233,7 @@ def build_pre_schedule_check(
 
     nurses = []
     for row_data in nurses_data:
-        nurse = parse_nurse_info_from_row(row_data, row_data.get('_row_index', 0), year)
+        nurse = parse_nurse_info_from_row(row_data, row_data.get('_row_index', 0), year, month)
         if nurse:
             nurses.append(nurse)
 
@@ -331,6 +331,69 @@ def build_pre_schedule_check(
         'next_small_night': _get_previous_nurse_name(nurses, last_small_night),
         'next_holiday': _get_next_nurse_name(nurses, last_holiday),
     }
+
+
+def get_return_credit_candidates_from_nurses(
+    sheet_name: str,
+    nurses: List[NurseInfo],
+    target_year: int = None,
+    target_month: int = None,
+) -> List[ReturnCredit]:
+    """
+    從已解析的護理人員清單找出「上月結轉」還班候選（source='carry_over_detected'）。
+
+    候選只是「Excel 裡有這筆舊資料」，approved 預設 False，
+    一定要經過 Streamlit UI 核准才會真正影響排班。
+    來源限定為上月 Excel 大夜/小夜週欄位括號內解析出來的國定假日日期
+    （night_shift_holiday_compensations / small_night_shift_holiday_compensations），
+    這些在排班前（不用真的跑一次排班）就能確定，適合拿來給使用者核准。
+
+    注意：本月排班過程中「這次新產生」的國假補償（大夜/小夜真的排到本月的
+    平日國定假日）是另一種來源 source='current_month_auto'，approved 自動
+    是 True、不需要 UI 核准，由 schedule_holiday_shifts() 在排班當下直接
+    建立與使用，不會出現在這份「排班前」候選清單裡。
+
+    只保留來源日期落在「上個月」（target_month - 1）的候選：Excel 裡的
+    大夜/小夜週欄位是逐月往前抄的歷史記錄，若這次讀到的來源日期比上個月
+    還早（例如本次用 10 月表排 11 月，卻抓到 9 月的補X/X），代表那筆資格
+    在上個月自己排班時就已經有機會核准/用掉，不該在這次又冒出來當候選，
+    否則使用者每個月都要重新忽略同一批舊資料。若沒帶 target_year/
+    target_month（呼叫端尚未提供），維持不過濾以相容舊行為。
+    """
+    prev_month = None
+    prev_year = None
+    if target_year is not None and target_month is not None:
+        prev_month = target_month - 1 if target_month > 1 else 12
+        prev_year = target_year if target_month > 1 else target_year - 1
+
+    candidates: List[ReturnCredit] = []
+    for nurse in nurses:
+        seen_dates = set()
+        for source_type, dates in (
+            ('大夜', nurse.night_shift_holiday_compensations),
+            ('小夜', nurse.small_night_shift_holiday_compensations),
+        ):
+            for d in dates:
+                day = d.date() if hasattr(d, 'date') else d
+                if prev_month is not None and not (day.month == prev_month and day.year == prev_year):
+                    print(f"[上月結轉候選-過濾] sheet={sheet_name} nurse={nurse.name} source_date={day} 不在上個月，略過")
+                    continue
+                dedupe_key = (day, source_type)
+                if dedupe_key in seen_dates:
+                    continue
+                seen_dates.add(dedupe_key)
+                credit_id = make_return_credit_id(sheet_name, nurse.name, d, source_type)
+                candidates.append(ReturnCredit(
+                    credit_id=credit_id,
+                    sheet_name=sheet_name,
+                    nurse_name=nurse.name,
+                    source_date=d,
+                    source_type=source_type,
+                    source='carry_over_detected',
+                    approved=False,
+                ))
+                print(f"[上月結轉候選] sheet={sheet_name} nurse={nurse.name} source_date={day} source_type={source_type}")
+    return candidates
 
 
 def print_night_shift_preview(results: List[Dict], month: int, sheet_name: str):
@@ -670,7 +733,7 @@ def process_sheet(
     priority_makeup_entries: Optional[List[Dict[str, Any]]] = None,
     extra_makeup_entries: Optional[List[Dict[str, Any]]] = None,
     manual_makeup_note: str = '',
-    return_credit_entries: Optional[List[Dict[str, Any]]] = None,
+    approved_return_credits: Optional[List[ReturnCredit]] = None,
 ) -> Tuple[List[NurseInfo], List[Dict], List[Dict], List, List[Dict], str, str, str, set, set]:
     """
     處理單一頁籤的排班
@@ -688,7 +751,7 @@ def process_sheet(
     # 解析護理人員資訊
     nurses = []
     for row_data in nurses_data:
-        nurse = parse_nurse_info_from_row(row_data, row_data.get('_row_index', 0), year)
+        nurse = parse_nurse_info_from_row(row_data, row_data.get('_row_index', 0), year, month)
         if nurse:
             nurses.append(nurse)
 
@@ -697,45 +760,28 @@ def process_sheet(
     # 將手動新增的過去欠班紀錄套用到護理人員資料中
     _apply_manual_shift_entries(nurses, manual_shift_entries)
 
-    # 掃描假日欄「補X/X」「捕X/X」記錄，找出已在上個月用掉的補償日期，
-    # 避免同一筆補償被結轉到本月重複使用（同一份補償只能扣一次）。
-    from excel_handler import find_already_consumed_compensation_dates_from_excel
-    already_consumed = find_already_consumed_compensation_dates_from_excel(filepath, sheet_name, year)
-
     # 清除「預排」的國假補償記錄，保留「已確定」的記錄
     # 判斷方式：看小夜週的開始日期是否在上個月
-    # - 小夜週開始日期在上個月（跨月班，已確定）→ 保留，本月可依規則跳假日值班一次（即「還班」）。
-    # - 小夜週開始日期在本月（預排，尚未確定）→ 清除。
+    # - 小夜週開始日期在上個月（跨月班）→ 已確定，保留
+    # - 小夜週開始日期在本月 → 預排，清除
     for nurse in nurses:
-        consumed_dates = {d.date() for d in already_consumed.get(nurse.name, [])}
-        if consumed_dates:
-            for d in list(nurse.holiday_compensations_used):
-                if d.date() in consumed_dates:
-                    nurse.holiday_compensations_used.remove(d)
-                    print(f"  {nurse.name} 的補償 {d.month}/{d.day} 已在上個月用掉，不結轉到本月")
-
         # 從大夜欄位讀取的補償 → 全部保留（上個月的結果，已確定）
         night_comps = nurse.night_shift_holiday_compensations
         if night_comps:
             print(f"  保留 {nurse.name} 的大夜班國假補償: {[f'{d.month}/{d.day}' for d in night_comps]}")
 
         # 從小夜週欄位讀取的補償：
-        # - 小夜週開始日期在上個月（跨月班，已確定）→ 保留，本月可跳一次假日班（還班）。
-        # - 小夜週開始日期在本月（預排，尚未確定）→ 清除。
+        # - 本月國定假日（例如 6/19）保留，之後可依規則跳假日值班一次。
+        # - 上月跨入的國定假日（例如 5/1）不再影響本月假日輪序。
         small_night_comps = nurse.small_night_shift_holiday_compensations
         if small_night_comps and nurse.small_night_shift_dates:
             # 取得小夜週的開始日期
             first_small_night_date = min(nurse.small_night_shift_dates)
             print(f"  檢查 {nurse.name} 的小夜週國假補償: {[f'{d.month}/{d.day}' for d in small_night_comps]} (小夜週開始於 {first_small_night_date.month}/{first_small_night_date.day})")
-            # 「上個月」要同時比對年份和月份，不能只看月份數字——
-            # 例如排 1 月時，上個月是「去年」12 月，不是隨便一個 12 月。
-            prev_month = 12 if month == 1 else month - 1
-            prev_year = year - 1 if month == 1 else year
-            if (first_small_night_date.year, first_small_night_date.month) != (prev_year, prev_month):
-                for d in small_night_comps:
-                    if d in nurse.holiday_compensations_used:
-                        nurse.holiday_compensations_used.remove(d)
-                        print(f"    移除非上月補償 {d.year}/{d.month}/{d.day}")
+            for d in small_night_comps:
+                if d.month != month and d in nurse.holiday_compensations_used:
+                    nurse.holiday_compensations_used.remove(d)
+                    print(f"    移除非本月補償 {d.month}/{d.day}")
 
     # 讀取跨月補班記錄（!開頭的假日班）
     print("讀取跨月補班記錄...")
@@ -876,17 +922,12 @@ def process_sheet(
     elif last_assigned_holiday_name:
         print(f"警告: 找不到 {last_assigned_holiday_name}，從第一個人開始排")
 
-    # 還班：UI 核准清單才生效，不能因為 Excel 裡有舊補償資料就自動觸發。
-    approved_return_credits: Dict[str, int] = {}
-    for entry in (return_credit_entries or []):
-        credit_name = entry.get('nurse_name')
-        credit_count = entry.get('credit_count', 1)
-        if credit_name:
-            approved_return_credits[credit_name] = approved_return_credits.get(credit_name, 0) + int(credit_count or 0)
-    if approved_return_credits:
-        print(f"本月核准還班名單: {approved_return_credits}")
-
     print("開始假日班定位點輪續排班（含補班）...")
+    # 還班 credit 只能給同一個 sheet 使用，避免不同頁籤剛好同名的人互相誤用。
+    sheet_return_credits = [
+        credit for credit in (approved_return_credits or [])
+        if credit.sheet_name == sheet_name
+    ]
     holiday_results, holiday_last_normal_name = schedule_holiday_shifts(
         nurses,
         year,
@@ -894,7 +935,8 @@ def process_sheet(
         last_holiday_index,
         regular_start_index=regular_holiday_start_index,
         extra_makeup_entries=extra_makeup_entries,
-        approved_return_credits=approved_return_credits,
+        sheet_name=sheet_name,
+        approved_return_credits=sheet_return_credits,
     )
     holiday_extra_makeup_results = []
     regular_holiday_results = []
@@ -1025,15 +1067,8 @@ def main():
             print(f"  - {error}")
         return
 
-    holiday_overflow = create_schedule_excel_multi_sheet(output_file, title, all_results, year, month)
+    create_schedule_excel_multi_sheet(output_file, title, all_results, year, month)
     print(f"\n排班結果已輸出到: {output_file}")
-
-    if holiday_overflow:
-        print("\n" + "!" * 70)
-        print(f"警告: 有 {len(holiday_overflow)} 筆假日欄位超出 Excel 版型（僅支援4欄），未寫入班表：")
-        for item in holiday_overflow:
-            print(f"  {item['sheet_name']} / {item['nurse_name']}：需要第{item['column_needed']}個假日欄位。未寫入：{item['display_text']}")
-        print("!" * 70)
 
     # 輸出摘要
     print("\n" + "=" * 70)
@@ -1046,9 +1081,6 @@ def main():
         print(f"  大夜班次數: {len(results['night_results'])}")
         print(f"  小夜週次數: {len(results['small_night_results'])}")
         print(f"  假日班次數: {len(results['holiday_results'])}")
-        sheet_overflow_count = sum(1 for item in (holiday_overflow or []) if item['sheet_name'] == sheet_name)
-        if sheet_overflow_count:
-            print(f"  假日欄位超出版型: {sheet_overflow_count} 筆（未寫入 Excel，詳見上方警告）")
         print(f"  定位點:")
         print(f"    大夜: {results['night_last_normal']}")
         print(f"    小夜週: {results['small_night_last_normal']}")

@@ -11,12 +11,18 @@ from date_utils import (
     parse_dot_separated_dates,
     parse_date_range,
     would_cause_consecutive_7_days,
+    get_night_week_rest_days,
     get_p_shift_dates_for_month,
     is_holiday,
+    is_holiday_in_own_year,
 )
 
 
-def extract_parenthesized_dates(text: str, default_year: int = 2026) -> Tuple[List[datetime], str]:
+def extract_parenthesized_dates(
+    text: str,
+    default_year: int = 2026,
+    reference_month: Optional[int] = None,
+) -> Tuple[List[datetime], str]:
     """
       '4/2.4/3.4/4 (4/3)' -> ([4/3], '4/2.4/3.4/4')
       '4/6-4/10(4/6,4/8)' -> ([4/6,4/8], '4/6-4/10')
@@ -29,7 +35,7 @@ def extract_parenthesized_dates(text: str, default_year: int = 2026) -> Tuple[Li
     def _replace(match: re.Match) -> str:
         inner = match.group(1)
         for date_str in re.findall(r'\d{1,2}/\d{1,2}', inner):
-            dt = parse_date_string(date_str, default_year)
+            dt = parse_date_string(date_str, default_year, reference_month)
             if dt:
                 extracted.append(dt)
         return ''
@@ -68,7 +74,12 @@ def extract_month_keywords(text: str) -> List[Tuple[str, str]]:
     return results
 
 
-def _parse_pending_makeup_token(token: str, default_year: int = 2026, column_index: int = 1) -> Optional[Dict[str, Any]]:
+def _parse_pending_makeup_token(
+    token: str,
+    default_year: int = 2026,
+    column_index: int = 1,
+    reference_month: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
     if not token or not isinstance(token, str):
         return None
 
@@ -109,8 +120,8 @@ def _parse_pending_makeup_token(token: str, default_year: int = 2026, column_ind
 
     range_match = re.match(r'^(\d{1,2}/\d{1,2})-(\d{1,2}/\d{1,2})$', normalized)
     if range_match:
-        start_date = parse_date_string(range_match.group(1), default_year)
-        end_date = parse_date_string(range_match.group(2), default_year)
+        start_date = parse_date_string(range_match.group(1), default_year, reference_month)
+        end_date = parse_date_string(range_match.group(2), default_year, reference_month)
         if start_date and end_date:
             if end_date < start_date:
                 end_date = end_date.replace(year=end_date.year + 1)
@@ -122,7 +133,7 @@ def _parse_pending_makeup_token(token: str, default_year: int = 2026, column_ind
     else:
         date_match = re.search(r'(\d{1,2}/\d{1,2})', normalized)
         if date_match:
-            dt = parse_date_string(date_match.group(1), default_year)
+            dt = parse_date_string(date_match.group(1), default_year, reference_month)
             if dt:
                 dates.append(dt)
                 target_date = dt
@@ -152,7 +163,11 @@ def _parse_pending_makeup_token(token: str, default_year: int = 2026, column_ind
     }
 
 
-def extract_pending_makeup(text: str, default_year: int = 2026) -> List[Dict[str, Any]]:
+def extract_pending_makeup(
+    text: str,
+    default_year: int = 2026,
+    reference_month: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """
     從文字中提取待補班資訊
     格式: '待補班:2/26-2/28大夜' 或 '6月補@6/14白班'
@@ -167,7 +182,9 @@ def extract_pending_makeup(text: str, default_year: int = 2026) -> List[Dict[str
     tokens = re.split(r'[\n、;；]+', text)
 
     for idx, token in enumerate(tokens, start=1):
-        record = _parse_pending_makeup_token(token, default_year, column_index=idx)
+        record = _parse_pending_makeup_token(
+            token, default_year, column_index=idx, reference_month=reference_month
+        )
         if record:
             results.append(record)
 
@@ -181,7 +198,11 @@ def _is_undated_makeup_marker(text: str) -> bool:
     return normalized in {'補', '待補', '補班', '待補班'}
 
 
-def extract_date_ranges(text: str, default_year: int = 2026) -> List[datetime]:
+def extract_date_ranges(
+    text: str,
+    default_year: int = 2026,
+    reference_month: Optional[int] = None,
+) -> List[datetime]:
     """
     從文字中提取所有日期範圍
     支援格式：
@@ -199,8 +220,8 @@ def extract_date_ranges(text: str, default_year: int = 2026) -> List[datetime]:
     matches = re.findall(range_pattern, text)
     
     for start_str, end_str in matches:
-        start_date = parse_date_string(start_str, default_year)
-        end_date = parse_date_string(end_str, default_year)
+        start_date = parse_date_string(start_str, default_year, reference_month)
+        end_date = parse_date_string(end_str, default_year, reference_month)
         
         if start_date and end_date:
             # 處理跨年的情況
@@ -248,8 +269,16 @@ def _get_first_value(row_data, keys):
                 return row_data.get(row_key, '')
     return ''
 
-def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: int = 2026) -> Optional[NurseInfo]:
-    """Parse nurse info from one Excel row."""
+def parse_nurse_info_from_row(
+    row_data: Dict[str, Any],
+    row_index: int,
+    year: int = 2026,
+    month: Optional[int] = None,
+) -> Optional[NurseInfo]:
+    """Parse nurse info from one Excel row.
+
+    month 為欲排班月份；有給時，上月等跨年日期會依最接近的年份解析。
+    """
     name_value = _get_first_value(row_data, ['\u59d3\u540d', '\u4e3b\u503c', '\u526f\u503c'])
     if not name_value or not isinstance(name_value, str):
         return None
@@ -316,7 +345,7 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
             elif keyword == '待命':
                 nurse.is_standby[month_str] = True
 
-        pending_makeups = extract_pending_makeup(field_value, year)
+        pending_makeups = extract_pending_makeup(field_value, year, month)
         for makeup in pending_makeups:
             if makeup.get('is_targeted_makeup'):
                 target_date = makeup.get('target_date')
@@ -354,7 +383,7 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
                         '',
                         seg_text,
                     )
-                    dates = extract_date_ranges(field_for_dates, year)
+                    dates = extract_date_ranges(field_for_dates, year, month)
 
                     if kind == '婚假':
                         nurse.wedding_leave_dates.extend(dates)
@@ -368,7 +397,7 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
                     field_value,
                 )
                 has_wedding_in_field = '婚假' in field_value
-                dates = extract_date_ranges(field_for_dates, year)
+                dates = extract_date_ranges(field_for_dates, year, month)
                 if has_wedding_in_field:
                     nurse.wedding_leave_dates.extend(dates)
                 else:
@@ -381,7 +410,7 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
                 field_value,
             )
             has_wedding_in_field = '婚假' in field_value
-            dates = extract_date_ranges(field_for_dates, year)
+            dates = extract_date_ranges(field_for_dates, year, month)
 
             if has_wedding_in_field:
                 nurse.wedding_leave_dates.extend(dates)
@@ -395,12 +424,22 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
 
     small_night_value = str(_get_first_value(row_data, ['\u5c0f\u591c', '\u5c0f\u591c\u9031'])).strip()
     if small_night_value and small_night_value != 'nan':
-        small_night_dates = extract_date_ranges(small_night_value, year)
+        small_night_dates = extract_date_ranges(small_night_value, year, month)
         if small_night_dates:
             nurse.had_small_night_last_month = True
 
     night_value = str(_get_first_value(row_data, ['\u5927\u591c'])).strip()
     if night_value and night_value != 'nan':
+        for month_str, keyword in extract_month_keywords(night_value):
+            if keyword in ['\u5927P1', '\u5c0fP1']:
+                nurse.is_p1[month_str] = keyword
+            elif keyword in ['\u5927P2', '\u5c0fP2']:
+                nurse.is_p2[month_str] = keyword
+            elif keyword == '\u63db\u5fc3':
+                nurse.is_transplant[month_str] = True
+            elif keyword == '\u5f85\u547d':
+                nurse.is_standby[month_str] = True
+
         if _is_undated_makeup_marker(night_value):
             nurse.pending_night_makeup.append({
                 'dates': [],
@@ -413,18 +452,34 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
                 'is_undated_makeup': True,
             })
         else:
-            comp_dates, night_value_clean = extract_parenthesized_dates(night_value, year)
+            comp_dates, night_value_clean = extract_parenthesized_dates(night_value, year, month)
             if comp_dates:
                 nurse.holiday_compensations_used.extend(comp_dates)
                 # 記錄來源：從大夜欄位讀取（上個月的結果，已確定）
                 nurse.night_shift_holiday_compensations.extend(comp_dates)
             night_value_clean = night_value_clean.replace('#', '')
-            night_dates = parse_dot_separated_dates(night_value_clean, year)
+            night_dates = parse_dot_separated_dates(night_value_clean, year, month)
             nurse.night_shift_dates.extend(night_dates)
             nurse.manual_night_shift_dates.extend(night_dates)
+            # 大夜欄沒有括號標註時（例如 12/31.1/1.1/2），排到平日國定假日也要還班。
+            for d in night_dates:
+                if is_holiday_in_own_year(d) and d.weekday() < 5 and d not in nurse.night_shift_holiday_compensations:
+                    nurse.night_shift_holiday_compensations.append(d)
+                    if d not in nurse.holiday_compensations_used:
+                        nurse.holiday_compensations_used.append(d)
 
     small_night_value = str(_get_first_value(row_data, ['\u5c0f\u591c', '\u5c0f\u591c\u9031'])).strip()
     if small_night_value and small_night_value != 'nan':
+        for month_str, keyword in extract_month_keywords(small_night_value):
+            if keyword in ['\u5927P1', '\u5c0fP1']:
+                nurse.is_p1[month_str] = keyword
+            elif keyword in ['\u5927P2', '\u5c0fP2']:
+                nurse.is_p2[month_str] = keyword
+            elif keyword == '\u63db\u5fc3':
+                nurse.is_transplant[month_str] = True
+            elif keyword == '\u5f85\u547d':
+                nurse.is_standby[month_str] = True
+
         if _is_undated_makeup_marker(small_night_value):
             nurse.pending_small_night_makeup.append({
                 'dates': [],
@@ -437,13 +492,13 @@ def parse_nurse_info_from_row(row_data: Dict[str, Any], row_index: int, year: in
                 'is_undated_makeup': True,
             })
         else:
-            comp_dates, small_night_value_clean = extract_parenthesized_dates(small_night_value, year)
+            comp_dates, small_night_value_clean = extract_parenthesized_dates(small_night_value, year, month)
             if comp_dates:
                 nurse.holiday_compensations_used.extend(comp_dates)
                 # 記錄來源：從小夜週欄位讀取（可能是預排）
                 nurse.small_night_shift_holiday_compensations.extend(comp_dates)
             small_night_value_clean = small_night_value_clean.replace('#', '')
-            small_dates = parse_date_range(small_night_value_clean, year)
+            small_dates = parse_date_range(small_night_value_clean, year, month)
             nurse.small_night_shift_dates.extend(small_dates)
             nurse.manual_small_night_shift_dates.extend(small_dates)
 
@@ -551,9 +606,12 @@ def should_skip_for_consecutive_days(
     target_year: int,
     prev_month: int = None,
     next_month: int = None,
+    is_night_shift: bool = False,
 ) -> Tuple[bool, str]:
     """
     檢查加入目標班後是否會造成連續 7 天上班。
+
+    大夜那一週的其他平日不用上白班，不算上班（is_night_shift 表示目標班是大夜）。
 
     同時計入目標日期前後的正常平日班、前後月 P1/P2/換心班，以及
     已排定的大夜和小夜週，避免跨月衝突只在最終稽核才被發現。
@@ -568,6 +626,9 @@ def should_skip_for_consecutive_days(
         for day in list(nurse.leave_dates) + list(nurse.wedding_leave_dates)
     }
 
+    night_rest_days = get_night_week_rest_days(
+        list(nurse.night_shift_dates) + (list(target_dates) if is_night_shift else [])
+    )
     existing_dates = []
     current = scan_start
     while current <= scan_end:
@@ -575,6 +636,7 @@ def should_skip_for_consecutive_days(
             current.weekday() < 5
             and not is_holiday(current)
             and current.date() not in leave_days
+            and current.date() not in night_rest_days
         ):
             existing_dates.append(current)
         current += timedelta(days=1)
