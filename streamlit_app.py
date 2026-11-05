@@ -114,7 +114,12 @@ DEFAULT_HOLIDAYS_TEMPLATE = {
 
 # 標題
 st.title("🏥 BOR 護理排班系統")
-st.markdown("**臺北榮民總醫院護理部思源手術室**")
+try:
+    from config import UNIT_NAME
+except Exception:
+    UNIT_NAME = ""  # config 載入失敗時，下方「匯入排班邏輯」會顯示錯誤
+if UNIT_NAME:
+    st.markdown(f"**{UNIT_NAME}**")
 st.markdown("---")
 
 # 匯入排班邏輯
@@ -1796,7 +1801,7 @@ if modules_loaded:
         output_filename = f"排班結果_{roc_year}年{month}月.xlsx"
         with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as output_tmp:
             output_path = output_tmp.name
-        title = f"臺北榮民總醫院護理部思源手術室{roc_year}年{month}月值班表"
+        title = f"{config.UNIT_NAME}{roc_year}年{month}月值班表"
         create_schedule_excel_multi_sheet(output_path, title, all_results, year, month)
         with open(output_path, 'rb') as f:
             output_bytes = f.read()

@@ -70,7 +70,7 @@ pyinstaller BOR排班系統.spec
 | `excel_handler.py` | Excel 讀取與輸出格式 |
 | `shift_utils.py` / `date_utils.py` | 班別判斷、日期與假日工具 |
 | `models.py` | 資料模型（護理人員、還班等） |
-| `config.py` / `holidays_config.json` | 班型定義、顏色、國定假日設定 |
+| `config.py` / `holidays_config.json` | 單位名稱（`UNIT_NAME`）、班型定義、顏色、國定假日設定 |
 | `launcher_standalone.py` / `BOR排班系統.spec` | 打包成單一執行檔用 |
 | `run_app.bat` | Windows 一鍵啟動 |
 

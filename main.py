@@ -1094,7 +1094,7 @@ def main():
 
     # 輸出到新的 Excel（多頁籤）
     output_file = f"排班結果_{roc_year}年{month}月.xlsx"
-    title = f"臺北榮民總醫院護理部思源手術室{roc_year}年{month}月值班表"
+    title = f"{config.UNIT_NAME}{roc_year}年{month}月值班表"
 
     from schedule_validation import validate_schedule_results
     validation_errors = validate_schedule_results(all_results, year, month)

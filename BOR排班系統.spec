@@ -43,7 +43,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='BOR排班系統v5.1',
+    name='BOR排班系統v5.2',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

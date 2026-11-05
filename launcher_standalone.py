@@ -9,6 +9,11 @@ import threading
 import time
 import socket
 
+try:
+    from config import UNIT_NAME
+except Exception:
+    UNIT_NAME = ""
+
 def get_exe_dir():
     """取得 exe 所在目錄（用於儲存 holidays_config.json）"""
     if getattr(sys, 'frozen', False):
@@ -61,8 +66,9 @@ def main():
         return
 
     print("=" * 50)
-    print("  BOR 護理排班系統 v5.1")
-    print("  臺北榮民總醫院護理部思源手術室")
+    print("  BOR 護理排班系統 v5.2")
+    if UNIT_NAME:
+        print(f"  {UNIT_NAME}")
     print("=" * 50)
     print()
     print("正在啟動，請稍候...")
