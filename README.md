@@ -76,7 +76,7 @@ pyinstaller BOR排班系統.spec
 
 ## 資料與個資
 
-值班表與排班結果 Excel 含有人員姓名，**不納入版本控制**（見 `.gitignore`），請另外保存。
+值班表與排班結果 Excel 含有人員姓名，**不納入版本控制**（見 `.gitignore`），請另外保存。唯一的例外是 `tests/fixtures/` 裡去識別化的測試資料，說明見 [tests/fixtures/README.md](tests/fixtures/README.md)。
 
 ## 版本紀錄
 

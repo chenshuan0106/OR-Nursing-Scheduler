@@ -26,3 +26,6 @@ dist/
 .claude/
 .agents/
 .vscode/
+
+# 例外：去識別化的測試資料（不含個資）可以納入
+!tests/fixtures/*.xlsx
