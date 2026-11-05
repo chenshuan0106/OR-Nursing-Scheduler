@@ -1,0 +1,9 @@
+# 開發與打包用套件（一般使用只需要 requirements.txt）
+# 安裝：pip install -r requirements-dev.txt
+-r requirements.txt
+
+# 打包成 .exe：pyinstaller BOR排班系統.spec
+pyinstaller>=6.22
+
+# 單元測試：pytest
+pytest>=9.1
